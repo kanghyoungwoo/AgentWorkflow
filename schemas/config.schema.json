@@ -1,0 +1,145 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "setupCommand": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "testCommand": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "wikiDir": {
+      "type": "string",
+      "minLength": 1
+    },
+    "app": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "startCommand",
+            "readyUrl"
+          ],
+          "properties": {
+            "startCommand": {
+              "type": "string",
+              "minLength": 1
+            },
+            "readyUrl": {
+              "type": "string",
+              "minLength": 1
+            },
+            "startTimeoutSec": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      ]
+    },
+    "roles": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "planningAuthor": {
+          "$ref": "#/definitions/role"
+        },
+        "planningReviewer": {
+          "$ref": "#/definitions/role"
+        },
+        "devAuthor": {
+          "$ref": "#/definitions/role"
+        },
+        "devReviewer": {
+          "$ref": "#/definitions/role"
+        },
+        "qa": {
+          "$ref": "#/definitions/role"
+        },
+        "wikiAuthor": {
+          "$ref": "#/definitions/role"
+        },
+        "wikiReviewer": {
+          "$ref": "#/definitions/role"
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxReviewRounds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sameIssueLimit": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxQaRollbacks": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxLanes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8
+        },
+        "stepTimeoutMin": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  },
+  "definitions": {
+    "role": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "client": {
+          "enum": [
+            "codex",
+            "claude"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort": {
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            null
+          ]
+        }
+      }
+    }
+  }
+}
