@@ -4,7 +4,7 @@ import { clientFor } from '../clients/index.ts';
 import type { AgentClient } from '../clients/index.ts';
 import { spawnProcess } from '../clients/spawn.ts';
 import { loadConfig } from '../config.ts';
-import { commitAll, diffNameOnly, headSha, restore, squash } from '../git.ts';
+import { commitAll, diffNameOnly, headSha, isAncestor, merge, restore, squash, worktreeAdd } from '../git.ts';
 import * as defaultAppRunner from '../qa/app-runner.ts';
 import { newLoopState, readState, writeState } from '../store/state.ts';
 import { appendEvent, developmentPath, fixPlanningPath, planningPath, qaDir, wikiPath } from '../store/runlog.ts';
@@ -13,7 +13,8 @@ import type {
   DevAuthorOutput, ExitCode, Issue, LaneState, LoopState, Plan, PlanAuthorOutput, QaReport,
   ReviewOutput, Role, RunEvent, WikiAuthorOutput, WorkspaceConfig,
 } from '../types.ts';
-import { gateEvidence, gateItems, gateQaReport, gateReq, gateTests, gateWikiScope } from './gates.ts';
+import { gateEvidence, gateItems, gateLanes, gateOwned, gateQaReport, gateReq, gateTests, gateWikiScope,
+  lanesOverlap } from './gates.ts';
 import { invoke } from './invoke.ts';
 import { eventMessage } from './event-message.ts';
 import type { SchemaName } from './invoke.ts';
@@ -24,6 +25,8 @@ import type { LoopPending } from './review-loop.ts';
 import { makeAgentCall } from './stages.ts';
 import type { StageInputs } from './stages.ts';
 import { renderPlan, renderReport, renderTodo } from './render.ts';
+
+type LaneContext = { lane?: LaneState; stage: string; role: Role | null; fixNumber: number };
 
 export type PipelineDeps = {
   clientFor?: (config: WorkspaceConfig, role: Role) => AgentClient;
@@ -53,45 +56,63 @@ export async function runPipeline(runDir: string, deps: PipelineDeps = {}): Prom
   const reqIds = parsed?.ok ? parsed.requirements.map(r => r.id) : [];
   const planPath = join(runDir, '01-planning/plan.json');
   let plan: Plan | null = JSON.parse(await optionalText(planPath) ?? 'null');
-  let fixNumber = 0;
-  try {
-    const paths = await readdir(join(runDir, '01-planning/fix'));
-    fixNumber = Math.max(0, ...paths.filter(path => /^main-\d+$/.test(path))
-      .map(path => Number(path.slice(5))));
-  } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-  if (state.lanes[0]?.phase === 'FIX_PLANNING' && state.lanes[0].loop.round === 0) fixNumber += 1;
-  let activeStage = !state.setupDone ? 'SETUP' : state.stage;
-  let activeLane: LaneState | undefined;
-  let activeRole: Role | null = null;
-  async function emit(type: RunEvent['type'], message: string, verdict: string | null = null,
-    round: number | null = null, role: Role | null = null, stage: string | null = activeStage) {
+  let queue: Promise<unknown> = Promise.resolve();
+  function serial<T>(work: () => Promise<T>): Promise<T> {
+    const result = queue.then(work);
+    queue = result.catch(() => {});
+    return result;
+  }
+  const persist = () => serial(() => writeState(runDir, state));
+  const runContext: LaneContext = {
+    stage: !state.setupDone ? 'SETUP' : state.stage, role: null, fixNumber: 0,
+  };
+  async function contextFor(lane: LaneState): Promise<LaneContext> {
+    let fixNumber = 0;
+    try {
+      const paths = await readdir(join(runDir, '01-planning/fix'));
+      const prefix = lane.id + '-';
+      const fixes = paths.filter(path => path.startsWith(prefix) && /^\d+$/.test(path.slice(prefix.length)));
+      fixNumber = Math.max(0, ...fixes.map(path => Number(path.slice(prefix.length))));
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    if (lane.phase === 'FIX_PLANNING' && lane.loop.round === 0) fixNumber += 1;
+    return { lane, stage: lane.phase, role: null, fixNumber };
+  }
+  async function emitUnlocked(ctx: LaneContext, type: RunEvent['type'], message: string, verdict: string | null = null,
+    round: number | null = null, role: Role | null = null, stage: string | null = ctx.stage) {
     const event: RunEvent = {
-      at: now().toISOString(), type, message, verdict, round, role, stage, lane: activeLane?.id ?? null,
+      at: now().toISOString(), type, message, verdict, round, role, stage, lane: ctx.lane?.id ?? null,
     };
     await writeState(runDir, state);
     await appendEvent(runDir, event);
     deps.onEvent?.(event);
   }
-  async function pause(value: LoopPending): Promise<ExitCode> {
+  async function pauseUnlocked(ctx: LaneContext, value: LoopPending): Promise<ExitCode> {
     const events = await optionalText(join(runDir, 'events.jsonl')) ?? '';
     const previous = [...events.matchAll(/"message":"P-(\d+):/g)].map(m => Number(m[1]));
     const next = Math.max(0, ...previous, ...state.pending.map(p => Number(p.id.slice(2)))) + 1;
     const id = `P-${String(next).padStart(3, '0')}`;
     state.pending.push({
-      ...value, id, lane: activeLane?.id ?? null, stage: activeStage, createdAt: now().toISOString(),
+      ...value, id, lane: ctx.lane?.id ?? null, stage: ctx.stage, createdAt: now().toISOString(),
     });
     state.status = 'PAUSED';
-    if (activeLane) activeLane.status = 'PAUSED';
+    if (ctx.lane) ctx.lane.status = 'PAUSED';
     state.lastExitCode = pendingExit(state.pending.map(p => p.exitCode));
-    if (value.kind === 'rate_limited') await emit('rate_limit', value.detail, value.kind, null, activeRole);
-    await emit('pause', `${id}: ${value.summary}`, value.kind);
+    if (value.kind === 'rate_limited') await emitUnlocked(ctx, 'rate_limit', value.detail, value.kind, null, ctx.role);
+    await emitUnlocked(ctx, 'pause', `${id}: ${value.summary}`, value.kind);
     return state.lastExitCode as ExitCode;
   }
-  async function savePlan(round = activeLane?.loop.round ?? 0) {
+  function emit(ctx: LaneContext, type: RunEvent['type'], message: string, verdict: string | null = null,
+    round: number | null = null, role: Role | null = null, stage: string | null = ctx.stage) {
+    return serial(() => emitUnlocked(ctx, type, message, verdict, round, role, stage));
+  }
+  function pause(ctx: LaneContext, value: LoopPending): Promise<ExitCode> {
+    return serial(() => pauseUnlocked(ctx, value));
+  }
+  async function savePlanUnlocked(ctx: LaneContext, round = ctx.lane?.loop.round ?? 0) {
     await saveJson(planPath, plan);
     await writeFile(join(runDir, '01-planning/plan.md'), renderPlan(plan!));
-    if (state.lanes.length) {
-      const path = join(runDir, '02-development/main/todo.md');
+    for (const lane of [...state.lanes, ...(state.integration ? [state.integration] : [])]) {
+      const path = join(runDir, '02-development', lane.id, 'todo.md');
       await mkdir(dirname(path), { recursive: true });
       const previous = await optionalText(path) ?? '';
       const approvals: Record<string, number> = {};
@@ -100,95 +121,102 @@ export async function runPipeline(runDir: string, deps: PipelineDeps = {}): Prom
         const round = /검수: 승인 \(round (\d+)\)/.exec(entry)?.[1];
         if (id && round) approvals[id] = Number(round);
       }
-      await writeFile(path, renderTodo(plan!, round, approvals));
+      await writeFile(path, renderTodo(plan!, lane.loop.round || round, approvals, lane.id));
     }
   }
-  async function call<T>(role: Role, schemaName: SchemaName, loop: LoopState, input: StageInputs,
+  const savePlan = (ctx: LaneContext) => serial(() => savePlanUnlocked(ctx));
+  async function call<T>(ctx: LaneContext, role: Role, schemaName: SchemaName, loop: LoopState, input: StageInputs,
     path: string, writable = false) {
-    activeRole = role;
+    ctx.role = role;
     await mkdir(dirname(path), { recursive: true });
     const outcome = await invoke<T>({
       client: (deps.clientFor ?? clientFor)(config, role), schemaName,
-      guardDir: writable ? null : activeLane?.worktree ?? state.runWorktree,
+      guardDir: writable ? null : ctx.lane?.worktree ?? state.runWorktree,
       makeCall: async (_attempt, error) => {
         if (deps.interrupted?.()) throw new Error('시그널로 실행이 중단되었습니다.');
         const value = await makeAgentCall(role, {
-          config, state, runDir, loop, lane: activeLane?.id ?? null, stage: activeStage, inputs: input, error,
+          config, state, runDir, loop, lane: ctx.lane?.id ?? null, stage: ctx.stage, inputs: input, error,
         });
-        await writeState(runDir, state);
+        await persist();
         return value;
       },
       afterAttempt: writable ? async () => {
-        const sha = await commitAll(activeLane?.worktree ?? state.runWorktree,
-          `aw(${state.runId}): wip ${activeLane?.id ?? 'run'} ${activeStage} r${loop.round}`);
-        if (sha) await emit('commit', sha, 'WIP', loop.round);
+        const sha = await commitAll(ctx.lane?.worktree ?? state.runWorktree,
+          `aw(${state.runId}): wip ${ctx.lane?.id ?? 'run'} ${ctx.stage} r${loop.round}`);
+        if (sha) await emit(ctx, 'commit', sha, 'WIP', loop.round);
       } : undefined,
     });
     if (outcome.kind === 'ok') await saveJson(path, outcome.output);
     if (deps.interrupted?.()) throw new Error('시그널로 실행이 중단되었습니다.');
     return outcome;
   }
-  async function loopEmit(event: Omit<RunEvent, 'at'>) {
-    await emit(event.type, event.message, event.verdict, event.round,
-      event.type === 'author' || event.type === 'review' ? activeRole : null);
+  async function loopEmit(ctx: LaneContext, event: Omit<RunEvent, 'at'>) {
+    await emit(ctx, event.type, event.message, event.verdict, event.round,
+      event.type === 'author' || event.type === 'review' ? ctx.role : null);
   }
-  async function planning(fix: boolean) {
-    const loop = fix ? activeLane!.loop : state.planning;
+  async function planning(ctx: LaneContext, fix: boolean) {
+    const loop = fix ? ctx.lane!.loop : state.planning;
     const defects = fix ? JSON.parse(await readFile(
-      join(qaDir(runDir, 'main', activeLane!.qaAttempt), 'report.json'), 'utf8')).defects : undefined;
+      join(qaDir(runDir, ctx.lane!.id, ctx.lane!.qaAttempt), 'report.json'), 'utf8')).defects : undefined;
     const inputs: StageInputs = {
       context: {}, request, ...(fix ? { plan: plan!, defects } : {}),
-      decisions: [...(activeLane?.decisions ?? []), ...loop.decisions],
+      decisions: [...(ctx.lane?.decisions ?? []), ...loop.decisions],
     };
     const path = (kind: string) => fix
-      ? fixPlanningPath(runDir, 'main', fixNumber, loop.round, kind)
+      ? fixPlanningPath(runDir, ctx.lane!.id, ctx.fixNumber, loop.round, kind)
       : planningPath(runDir, loop.round, kind);
     return runReviewLoop<PlanAuthorOutput>(loop, config.limits, {
       author: async () => {
         inputs.context = {
-          mode: fix ? 'fix' : 'initial', parallel: false, maxLanes: config.limits.maxLanes,
-          hasApp: config.app !== null, round: loop.round, lane: activeLane?.id ?? null,
+          mode: fix ? 'fix' : 'initial', parallel: !fix && state.parallel, maxLanes: config.limits.maxLanes,
+          hasApp: config.app !== null, round: loop.round, lane: ctx.lane?.id ?? null,
         };
-        return call('planningAuthor', 'plan-author', loop, inputs, path('author'));
+        return call(ctx, 'planningAuthor', 'plan-author', loop, inputs, path('author'));
       },
       gates: async output => {
         const finding = gateReq(output, {
-          mode: fix ? 'fix' : 'initial', reqIds, hasApp: config.app !== null, parallel: false,
+          mode: fix ? 'fix' : 'initial', reqIds, hasApp: config.app !== null, parallel: !fix && state.parallel,
           plan, defectIds: defects?.map((d: { id: string }) => d.id) ?? [],
         });
-        const issues = finding ? [finding] : [];
+        const lanes = !fix && state.parallel ? gateLanes(output, { maxLanes: config.limits.maxLanes }) : null;
+        const issues = [finding, lanes].filter((value): value is Issue => value !== null);
         await saveJson(path('gate'), issues);
         return issues;
       },
-      review: output => call<ReviewOutput>('planningReviewer', 'review', loop,
+      review: output => call<ReviewOutput>(ctx, 'planningReviewer', 'review', loop,
         { ...inputs, output }, path('review')),
-      emit: loopEmit,
+      emit: event => loopEmit(ctx, event),
     });
   }
-  async function development(lane: LaneState) {
+  async function development(ctx: LaneContext) {
+    const lane = ctx.lane!;
     const loop = lane.loop;
     loop.stageBase ??= await headSha(lane.worktree);
-    await writeState(runDir, state);
+    await persist();
     const targets = plan!.todos.filter(t => t.lane === lane.id && !t.approved);
     const path = (kind: string, ext = 'json') => developmentPath(runDir, lane.id, loop.round, kind, ext,
-      fixNumber || undefined);
+      ctx.fixNumber || undefined);
     let testResult = '(테스트 명령 없음)';
     return runReviewLoop<DevAuthorOutput>(loop, config.limits, {
       author: async () => {
-        const result = await call<DevAuthorOutput>('devAuthor', 'dev-author', loop, {
+        const result = await call<DevAuthorOutput>(ctx, 'devAuthor', 'dev-author', loop, {
           context: {
-            lane: lane.id, ownedPaths: null, interfaces: null, testCommand: config.testCommand, round: loop.round,
+            lane: lane.id, ownedPaths: lane.ownedPaths,
+            interfaces: plan!.lanes?.find(l => l.id === lane.id)?.interfaces ?? null,
+            testCommand: config.testCommand, round: loop.round,
           },
           targets: targets.map(t => ({ id: t.id, text: t.text })),
           approved: plan!.todos.filter(t => t.approved).map(t => ({ id: t.id, text: t.text })),
           decisions: [...lane.decisions, ...loop.decisions],
         }, path('author'), true);
         if (result.kind === 'ok') {
-          for (const item of result.output.items) {
-            const target = targets.find(t => t.id === item.id);
-            if (target) { target.checked = item.checked; target.evidence = item.evidence; }
-          }
-          await savePlan();
+          await serial(async () => {
+            for (const item of result.output.items) {
+              const target = targets.find(t => t.id === item.id);
+              if (target) { target.checked = item.checked; target.evidence = item.evidence; }
+            }
+            await savePlanUnlocked(ctx);
+          });
         }
         return result;
       },
@@ -202,38 +230,55 @@ export async function runPipeline(runDir: string, deps: PipelineDeps = {}): Prom
         if (config.testCommand) {
           const tail = (await readFile(path('tests', 'log'), 'utf8')).split('\n').slice(-200).join('\n');
           testResult = `명령: ${config.testCommand}\n종료 코드: ${tests ? '실패 (GATE-TESTS 참조)' : '0'}\n${tail}`;
-          await emit('tests', testResult, tests ? 'FAIL' : 'PASS', loop.round);
+          await emit(ctx, 'tests', testResult, tests ? 'FAIL' : 'PASS', loop.round);
         }
-        const issues = [items, evidence, tests].filter((value): value is Issue => value !== null);
+        const owned = lane.ownedPaths ? await gateOwned({
+          cwd: lane.worktree, stageBase: loop.stageBase!, ownedPaths: lane.ownedPaths,
+        }) : null;
+        const issues = [items, evidence, tests, owned].filter((value): value is Issue => value !== null);
         await saveJson(path('gate'), issues);
         return issues;
       },
-      review: output => call<ReviewOutput>('devReviewer', 'review', loop, {
-        context: { lane: lane.id, stageBase: loop.stageBase, ownedPaths: null }, request,
+      review: output => call<ReviewOutput>(ctx, 'devReviewer', 'review', loop, {
+        context: { lane: lane.id, stageBase: loop.stageBase, ownedPaths: lane.ownedPaths }, request,
         targets: targets.map(t => ({ id: t.id, text: t.text, checked: t.checked, evidence: t.evidence })),
         testResult, notes: output.notes, decisions: [...lane.decisions, ...loop.decisions],
       }, path('review')),
-      emit: loopEmit,
+      emit: event => loopEmit(ctx, event),
     });
   }
-  async function qa(lane: LaneState): Promise<QaOutcome> {
-    const scenarios = plan!.qaScenarios;
+  async function qa(ctx: LaneContext): Promise<QaOutcome> {
+    const lane = ctx.lane!;
+    const scenarios = lane.ownedPaths ? plan!.qaScenarios.filter(s => s.lane === lane.id) : plan!.qaScenarios;
     lane.qaAttempt += 1;
     let directory = qaDir(runDir, lane.id, lane.qaAttempt);
     const prepareDirectory = async () => {
       await mkdir(join(directory, 'scripts'), { recursive: true });
       await mkdir(join(directory, 'evidence'), { recursive: true });
-      await writeState(runDir, state);
+      await persist();
     };
     await prepareDirectory();
-    if (!scenarios.length) {
-      await emit('skip', '시나리오 0/0 PASS, 결함 없음 (skipped: QA 시나리오 없음)', 'PASS', lane.qaAttempt);
-      return { kind: 'skipped' };
-    }
     let handle: defaultAppRunner.AppHandle | null = null;
     const automatic: { outcome: QaOutcome | null } = { outcome: null };
     let baseUrl = 'none';
     const start = async () => {
+      if (lane.id === 'integration' && config.testCommand) {
+        const logPath = join(directory, 'evidence/integration-tests.log');
+        const finding = await gateTests({
+          cwd: lane.worktree, testCommand: config.testCommand,
+          timeoutMs: config.limits.stepTimeoutMin * 60_000, logPath,
+        });
+        await emit(ctx, 'tests', finding?.problem ?? '통합 테스트 통과', finding ? 'FAIL' : 'PASS', lane.qaAttempt);
+        if (finding) {
+          automatic.outcome = { kind: 'auto_fail', defect: {
+            id: 'BUG-INTEGRATION-TESTS', scenarioId: null, title: '통합 테스트 실패',
+            reproduction: [config.testCommand], expected: '종료 코드 0', actual: finding.problem,
+            evidence: ['evidence/integration-tests.log'],
+          } };
+          throw new Error(finding.problem);
+        }
+      }
+      if (!scenarios.length) return;
       if (config.app) {
         let port: number;
         try { port = await appRunner.portForSlot(lane.portSlot, config.limits.maxLanes); }
@@ -261,7 +306,12 @@ export async function runPipeline(runDir: string, deps: PipelineDeps = {}): Prom
     let outcome: QaOutcome;
     const qaBase = await headSha(lane.worktree);
     try {
-      activeRole = 'qa';
+      if (!scenarios.length) {
+        await start();
+        await emit(ctx, 'skip', '시나리오 0/0 PASS, 결함 없음 (skipped: QA 시나리오 없음)', 'PASS', lane.qaAttempt);
+        return { kind: 'skipped' };
+      }
+      ctx.role = 'qa';
       const result = await invoke<QaReport>({
         client: (deps.clientFor ?? clientFor)(config, 'qa'), schemaName: 'qa-report', guardDir: lane.worktree,
         makeCall: async (attempt, error) => {
@@ -269,7 +319,7 @@ export async function runPipeline(runDir: string, deps: PipelineDeps = {}): Prom
           await prepareDirectory();
           await start();
           const call = await makeAgentCall('qa', {
-            config, state, runDir, loop: lane.loop, lane: lane.id, stage: 'QA', error,
+            config, state, runDir, loop: lane.loop, lane: lane.id, stage: ctx.stage, error,
             inputs: {
               context: {
                 scope: lane.id, worktree: lane.worktree, baseUrl, qaDir: directory,
@@ -277,7 +327,7 @@ export async function runPipeline(runDir: string, deps: PipelineDeps = {}): Prom
               }, scenarios, decisions: lane.decisions,
             },
           });
-          await writeState(runDir, state);
+          await persist();
           return call;
         },
         afterAttempt: stop,
@@ -299,17 +349,17 @@ export async function runPipeline(runDir: string, deps: PipelineDeps = {}): Prom
       let message = `시나리오 ${passed}/${scenarios.length} PASS, ${defects}`;
       if (outcome.kind === 'auto_fail') message += ` (자동 결함: ${outcome.defect.title})`;
       if (report.status === 'BLOCKED') message += ` (${report.blocker!.kind}: ${report.blocker!.detail})`;
-      await emit('qa', eventMessage(message), report.status, lane.qaAttempt, 'qa');
+      await emit(ctx, 'qa', eventMessage(message), report.status, lane.qaAttempt, 'qa');
     } else if (outcome.kind !== 'skipped') {
-      await emit('qa', eventMessage(`${outcome.kind}: ${outcome.detail}`),
+      await emit(ctx, 'qa', eventMessage(`${outcome.kind}: ${outcome.detail}`),
         outcome.kind === 'environment' ? 'BLOCKED' : outcome.kind, lane.qaAttempt, 'qa');
     }
     return outcome;
   }
-  async function wiki() {
+  async function wiki(ctx: LaneContext) {
     const loop = state.wiki ??= newLoopState();
     loop.stageBase ??= await headSha(state.runWorktree);
-    await writeState(runDir, state);
+    await persist();
     const changedFiles = (await diffNameOnly(state.runWorktree, state.sinceRef ?? state.baseRef))
       .filter(path => path !== config.wikiDir && !path.startsWith(config.wikiDir.replace(/\/$/, '') + '/'));
     const date = now();
@@ -326,7 +376,7 @@ export async function runPipeline(runDir: string, deps: PipelineDeps = {}): Prom
           wikiDir: config.wikiDir, stageBase: loop.stageBase, round: loop.round, runId: state.runId, date: localDate,
         };
         inputs.index = await optionalText(join(state.runWorktree, config.wikiDir, 'index.md'));
-        return call('wikiAuthor', 'wiki-author', loop, inputs, path('author'), true);
+        return call(ctx, 'wikiAuthor', 'wiki-author', loop, inputs, path('author'), true);
       },
       gates: async output => {
         const finding = await gateWikiScope(output, {
@@ -336,120 +386,190 @@ export async function runPipeline(runDir: string, deps: PipelineDeps = {}): Prom
         await saveJson(path('gate'), issues);
         return issues;
       },
-      review: async output => call<ReviewOutput>('wikiReviewer', 'review', loop, {
+      review: async output => call<ReviewOutput>(ctx, 'wikiReviewer', 'review', loop, {
         ...inputs, output, index: await optionalText(join(state.runWorktree, config.wikiDir, 'index.md')),
       }, path('review')),
-      emit: loopEmit,
+      emit: event => loopEmit(ctx, event),
     });
+  }
+  async function setup(ctx: LaneContext): Promise<boolean> {
+    const lane = ctx.lane;
+    ctx.stage = 'SETUP';
+    if (lane && lane.worktree !== state.runWorktree && !await optionalText(join(lane.worktree, '.git'))) {
+      await worktreeAdd(state.workspace, lane.worktree, lane.branch, state.runBranch);
+    }
+    if (config.setupCommand) {
+      const directory = lane ? join(runDir, '02-development', lane.id) : runDir;
+      await mkdir(directory, { recursive: true });
+      const files = await readdir(directory);
+      const attempt = Math.max(0, ...files.filter(path => /^setup-\d+\.log$/.test(path))
+        .map(path => Number(path.slice(6, -4)))) + 1;
+      const logPath = join(directory, `setup-${attempt}.log`);
+      await persist();
+      const result = await spawnProcess({
+        command: 'sh', args: ['-c', config.setupCommand], cwd: lane?.worktree ?? state.runWorktree, stdin: '',
+        timeoutMs: config.limits.stepTimeoutMin * 60_000, stdoutPath: logPath, stderrPath: logPath,
+      });
+      if (deps.interrupted?.()) throw new Error('시그널로 실행이 중단되었습니다.');
+      if (result.exitCode !== 0 || result.timedOut) {
+        await pause(ctx, pending('environment', 20, 'SETUP 실행에 실패했습니다.',
+          (await readFile(logPath, 'utf8')).split('\n').slice(-200).join('\n')));
+        return false;
+      }
+    }
+    if (lane) lane.setupDone = true;
+    else state.setupDone = true;
+    await emit(ctx, 'setup', 'SETUP을 완료했습니다.', 'PASS');
+    return true;
+  }
+  async function executeLane(ctx: LaneContext): Promise<void> {
+    const lane = ctx.lane!;
+    try {
+      if (!lane.setupDone && !await setup(ctx)) return;
+      while (lane.status === 'ACTIVE') {
+        ctx.stage = lane.id === 'integration' && lane.phase === 'QA' ? 'INTEGRATION_QA' : lane.phase;
+        ctx.role = null;
+        if (deps.interrupted?.()) throw new Error('시그널로 실행이 중단되었습니다.');
+        if (lane.phase === 'DEV') {
+          const targets = plan!.todos.filter(t => t.lane === lane.id && !t.approved);
+          if (targets.length) {
+            const result = await development(ctx);
+            if (result.kind === 'paused') { await pause(ctx, result.pending); return; }
+            const sha = await squash(lane.worktree, lane.loop.stageBase!,
+              `aw(${state.runId}): ${lane.id} DEV 승인 (${targets.map(t => t.id).join(',')})`);
+            await serial(async () => {
+              for (const target of targets) target.approved = true;
+              await savePlanUnlocked(ctx);
+            });
+            if (sha) await emit(ctx, 'commit', sha, 'APPROVED', lane.loop.round);
+          }
+          lane.phase = 'QA'; lane.loop = newLoopState();
+        } else if (lane.phase === 'QA') {
+          const outcome = await qa(ctx);
+          const decision = decideQa(lane, outcome, config.limits);
+          if (decision.next === 'paused') { await pause(ctx, decision.pending); return; }
+          if (decision.next === 'fix') {
+            ctx.fixNumber += 1;
+            lane.phase = 'FIX_PLANNING'; lane.loop = newLoopState();
+          } else { lane.phase = 'DONE'; lane.status = 'DONE'; }
+        } else if (lane.phase === 'FIX_PLANNING') {
+          const result = await planning(ctx, true);
+          if (result.kind === 'paused') { await pause(ctx, result.pending); return; }
+          await serial(async () => {
+            const nextId = (prefix: string, ids: string[]) => `${prefix}-${String(
+              Math.max(0, ...ids.filter(id => id.startsWith(prefix + '-')).map(id => Number(id.split('-')[1]))) + 1,
+            ).padStart(3, '0')}`;
+            for (const todo of result.output.todos) {
+              const id = nextId('FIX', plan!.todos.map(t => t.id));
+              plan!.todos.push({ ...todo, id, lane: lane.id, checked: false, evidence: null, approved: false });
+              if (todo.id !== id) await emitUnlocked(ctx, 'renumber', `${todo.id} → ${id}`);
+            }
+            for (const scenario of result.output.qaScenarios) {
+              const id = nextId('QA', plan!.qaScenarios.map(s => s.id));
+              plan!.qaScenarios.push({ ...scenario, id, lane: lane.id === 'main' ? null : lane.id });
+              if (scenario.id !== id) await emitUnlocked(ctx, 'renumber', `${scenario.id} → ${id}`);
+            }
+            await savePlanUnlocked(ctx);
+          });
+          lane.phase = 'DEV'; lane.loop = newLoopState();
+        } else throw new Error(`지원하지 않는 레인 단계: ${lane.phase}`);
+        await persist();
+      }
+    } catch (error) {
+      await pause(ctx, pending('failed', 1, '파이프라인 실행이 중단되었습니다.', String(error)));
+    }
+  }
+  function newLane(id: string, branch: string, worktree: string, ownedPaths: string[] | null,
+    portSlot: number, setupDone: boolean, phase: LaneState['phase'] = 'DEV'): LaneState {
+    return {
+      id, branch, worktree, ownedPaths, portSlot, setupDone, phase, loop: newLoopState(), decisions: [],
+      qaAttempt: 0, qaRollbacks: 0, status: 'ACTIVE',
+    };
   }
   async function done(): Promise<ExitCode> {
     state.status = 'DONE'; state.stage = 'DONE'; state.lastExitCode = 0;
-    activeLane = undefined;
-    await emit('done', '런을 완료했습니다.', null, null, null, null);
+    await emit(runContext, 'done', '런을 완료했습니다.', null, null, null, null);
     return 0;
   }
   if (state.status === 'DONE') return 0;
-  if (state.pending.length) return pendingExit(state.pending.map(p => p.exitCode));
+  if (state.pending.length && !(state.stage === 'LANES' && state.lanes.some(l => l.status === 'ACTIVE'))) {
+    return pendingExit(state.pending.map(p => p.exitCode));
+  }
   try {
-    if (!state.setupDone) {
-      activeStage = 'SETUP';
-      if (config.setupCommand) {
-        const files = await readdir(runDir);
-        const attempt = Math.max(0, ...files.filter(path => /^setup-\d+\.log$/.test(path))
-          .map(path => Number(path.slice(6, -4)))) + 1;
-        const logPath = join(runDir, `setup-${attempt}.log`);
-        await writeState(runDir, state);
-        const result = await spawnProcess({
-          command: 'sh', args: ['-c', config.setupCommand], cwd: state.runWorktree, stdin: '',
-          timeoutMs: config.limits.stepTimeoutMin * 60_000, stdoutPath: logPath, stderrPath: logPath,
-        });
-        if (deps.interrupted?.()) throw new Error('시그널로 실행이 중단되었습니다.');
-        if (result.exitCode !== 0 || result.timedOut) {
-          return pause(pending('environment', 20, 'SETUP 실행에 실패했습니다.',
-            (await readFile(logPath, 'utf8')).split('\n').slice(-200).join('\n')));
-        }
-      }
-      state.setupDone = true;
-      await emit('setup', 'SETUP을 완료했습니다.', 'PASS');
-    }
+    if (!state.setupDone && !await setup(runContext)) return state.lastExitCode as ExitCode;
     while (true) {
-      activeStage = state.stage;
-      activeRole = null;
+      runContext.stage = state.stage;
+      runContext.role = null;
       if (deps.interrupted?.()) throw new Error('시그널로 실행이 중단되었습니다.');
       if (state.stage === 'PLANNING') {
-        const result = await planning(false);
-        if (result.kind === 'paused') return pause(result.pending);
+        const result = await planning(runContext, false);
+        if (result.kind === 'paused') return pause(runContext, result.pending);
+        const parallel = state.parallel && !lanesOverlap(result.output.lanes!);
+        if (state.parallel && !parallel) {
+          await emit(runContext, 'mode_switch', '레인 소유 경로 겹침 또는 단일 레인으로 순차 모드로 전환합니다.');
+        }
         plan = {
-          summary: result.output.summary, lanes: null,
+          summary: result.output.summary, lanes: parallel ? result.output.lanes : null,
           todos: result.output.todos.map(t => ({
-            ...t, lane: 'main', checked: false, evidence: null, approved: false,
-          })), qaScenarios: result.output.qaScenarios.map(s => ({ ...s, lane: null })),
+            ...t, lane: parallel ? t.lane! : 'main', checked: false, evidence: null, approved: false,
+          })), qaScenarios: result.output.qaScenarios.map(s => ({ ...s, lane: parallel ? s.lane : null })),
         };
-        state.lanes = [{
-          id: 'main', branch: state.runBranch, worktree: state.runWorktree, ownedPaths: null, portSlot: 0,
-          setupDone: true, phase: 'DEV', loop: newLoopState(), decisions: [], qaAttempt: 0,
-          qaRollbacks: 0, status: 'ACTIVE',
-        }];
-        await savePlan();
+        state.lanes = parallel ? plan.lanes!.map((lane, index) => newLane(
+          lane.id, `aw/${state.runId}-lane-${lane.id}`,
+          join(state.workspace, '.aw/worktrees', state.runId, `lane-${lane.id}`), lane.ownedPaths, index + 1, false,
+        )) : [newLane('main', state.runBranch, state.runWorktree, null, 0, true)];
+        await savePlan(runContext);
         state.stage = 'LANES';
-        await writeState(runDir, state);
+        await persist();
         if (state.mode === 'plan') return done();
       } else if (state.stage === 'LANES') {
-        const lane = activeLane = state.lanes[0];
-        activeStage = lane.phase;
-        if (lane.phase === 'DEV') {
-          const targets = plan!.todos.filter(t => !t.approved);
-          if (targets.length) {
-            const result = await development(lane);
-            if (result.kind === 'paused') return pause(result.pending);
-            const sha = await squash(lane.worktree, lane.loop.stageBase!,
-              `aw(${state.runId}): main DEV 승인 (${targets.map(t => t.id).join(',')})`);
-            for (const target of targets) target.approved = true;
-            await savePlan();
-            if (sha) await emit('commit', sha, 'APPROVED', lane.loop.round);
+        const contexts = await Promise.all(state.lanes.filter(l => l.status === 'ACTIVE').map(contextFor));
+        await Promise.all(contexts.map(executeLane));
+        if (state.pending.length) {
+          state.status = 'PAUSED';
+          state.lastExitCode = pendingExit(state.pending.map(p => p.exitCode));
+          await persist();
+          return state.lastExitCode as ExitCode;
+        }
+        state.stage = plan!.lanes !== null ? 'MERGE' : 'WIKI';
+        await persist();
+      } else if (state.stage === 'MERGE') {
+        for (const lane of [...state.lanes].sort((a, b) => a.id.localeCompare(b.id))) {
+          if (await isAncestor(state.runWorktree, lane.branch, 'HEAD')) continue;
+          const result = await merge(state.runWorktree, lane.branch);
+          await emit(runContext, 'merge', lane.branch, result.ok ? 'PASS' : 'CONFLICT');
+          if (!result.ok) {
+            const quote = (value: string) => /[^a-zA-Z0-9_./-]/.test(value)
+              ? "'" + value.replaceAll("'", "'\\''") + "'" : value;
+            const command = `git -C ${quote(state.runWorktree)} merge --no-ff ${quote(lane.branch)}`;
+            return pause(runContext, pending('merge_conflict', 20, '레인 머지 충돌을 해결해야 합니다.',
+              `worktree: ${state.runWorktree}\n충돌 파일: ${result.conflicts.join(', ')}\n${command}`));
           }
-          lane.phase = 'QA'; lane.loop = newLoopState();
-          await writeState(runDir, state);
-        } else if (lane.phase === 'QA') {
-          const outcome = await qa(lane);
-          const decision = decideQa(lane, outcome, config.limits);
-          if (decision.next === 'paused') return pause(decision.pending);
-          if (decision.next === 'fix') {
-            fixNumber += 1; lane.phase = 'FIX_PLANNING'; lane.loop = newLoopState();
-          }
-          else { lane.phase = 'DONE'; lane.status = 'DONE'; state.stage = 'WIKI'; }
-          await writeState(runDir, state);
-        } else if (lane.phase === 'FIX_PLANNING') {
-          const result = await planning(true);
-          if (result.kind === 'paused') return pause(result.pending);
-          const nextId = (prefix: string, ids: string[]) => `${prefix}-${String(
-            Math.max(0, ...ids.filter(id => id.startsWith(prefix + '-')).map(id => Number(id.split('-')[1]))) + 1,
-          ).padStart(3, '0')}`;
-          for (const todo of result.output.todos) {
-            const id = nextId('FIX', plan!.todos.map(t => t.id));
-            plan!.todos.push({ ...todo, id, lane: 'main', checked: false, evidence: null, approved: false });
-            await emit('renumber', `${todo.id} → ${id}`);
-          }
-          for (const scenario of result.output.qaScenarios) {
-            const id = nextId('QA', plan!.qaScenarios.map(s => s.id));
-            plan!.qaScenarios.push({ ...scenario, id, lane: null });
-            await emit('renumber', `${scenario.id} → ${id}`);
-          }
-          await savePlan();
-          lane.phase = 'DEV'; lane.loop = newLoopState();
-          await writeState(runDir, state);
-        } else throw new Error(`지원하지 않는 레인 단계: ${lane.phase}`);
+        }
+        state.integration = newLane('integration', state.runBranch, state.runWorktree, null, 0, true, 'QA');
+        state.stage = 'INTEGRATION_QA';
+        await savePlan(runContext);
+        await persist();
+      } else if (state.stage === 'INTEGRATION_QA') {
+        await executeLane(await contextFor(state.integration!));
+        if (state.pending.length) {
+          state.status = 'PAUSED';
+          state.lastExitCode = pendingExit(state.pending.map(p => p.exitCode));
+          await persist();
+          return state.lastExitCode as ExitCode;
+        }
+        state.stage = 'WIKI';
+        await persist();
       } else if (state.stage === 'WIKI') {
-        activeLane = undefined;
-        const result = await wiki();
-        if (result.kind === 'paused') return pause(result.pending);
+        const result = await wiki(runContext);
+        if (result.kind === 'paused') return pause(runContext, result.pending);
         const sha = await squash(state.runWorktree, state.wiki!.stageBase!,
           `aw(${state.runId}): run WIKI 승인`);
-        if (sha) await emit('commit', sha, 'APPROVED', state.wiki!.round);
+        if (sha) await emit(runContext, 'commit', sha, 'APPROVED', state.wiki!.round);
         return done();
       } else throw new Error(`지원하지 않는 단계: ${state.stage}`);
     }
   } catch (error) {
-    return pause(pending('failed', 1, '파이프라인 실행이 중단되었습니다.', String(error)));
+    return pause(runContext, pending('failed', 1, '파이프라인 실행이 중단되었습니다.', String(error)));
   }
 }

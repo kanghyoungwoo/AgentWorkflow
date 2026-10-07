@@ -101,12 +101,12 @@ export async function makeAgentCall(role: Role, options: CallOptions): Promise<A
   const schemaName: SchemaName = role.endsWith('Reviewer') ? 'review'
     : role === 'qa' ? 'qa-report' : role === 'devAuthor' ? 'dev-author'
       : role === 'wikiAuthor' ? 'wiki-author' : 'plan-author';
-  const lane = state.lanes.find(l => l.id === options.lane);
+  const lane = options.lane === 'integration' ? state.integration : state.lanes.find(l => l.id === options.lane);
   const worktree = lane?.worktree ?? state.runWorktree;
   const qaDir = typeof inputs.context.qaDir === 'string' ? inputs.context.qaDir : null;
   const cwd = role === 'qa' && config.roles.qa.client === 'codex' ? qaDir! : worktree;
   const round = role === 'qa' ? lane!.qaAttempt : loop.round;
-  state.seq += 1;
+  const seq = ++state.seq;
   return {
     role, profile: profileFor(role), grant: profileFor(role) === 'write' ? loop.grant : null, cwd,
     prompt: await assemblePrompt(role, { ...inputs.context, stageBase: loop.stageBase },
@@ -114,6 +114,6 @@ export async function makeAgentCall(role: Role, options: CallOptions): Promise<A
     schema: JSON.parse(await readFile(new URL(`../../schemas/${schemaName}.schema.json`, import.meta.url), 'utf8')),
     qaDir, model: config.roles[role].model, effort: config.roles[role].effort,
     timeoutMs: config.limits.stepTimeoutMin * 60_000,
-    rawPrefix: rawPrefix(options.runDir, state.seq, options.lane, options.stage, role, round),
+    rawPrefix: rawPrefix(options.runDir, seq, options.lane, options.stage, role, round),
   };
 }

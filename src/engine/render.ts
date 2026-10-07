@@ -14,8 +14,9 @@ export function renderPlan(plan: Plan): string {
     `- ${l.id}: ${l.title}\n  ownedPaths: ${l.ownedPaths.join(', ')}\n  interfaces: ${l.interfaces}`).join('\n') + '\n';
   return text;
 }
-export function renderTodo(plan: Plan, round: number, approvals: Record<string, number> = {}): string {
-  return plan.todos.filter(t => t.lane === 'main').map(t => {
+export function renderTodo(plan: Plan, round: number, approvals: Record<string, number> = {},
+  lane = 'main'): string {
+  return plan.todos.filter(t => t.lane === lane).map(t => {
     let text = `- [${t.checked ? 'x' : ' '}] ${t.id} ${t.text}\n`;
     if (t.evidence) text += `    완료 근거: ${t.evidence.summary} (files: ${t.evidence.files.join(', ')})\n`;
     if (t.approved) text += `    검수: 승인 (round ${approvals[t.id] ?? round})\n`;

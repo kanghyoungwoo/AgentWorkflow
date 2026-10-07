@@ -295,8 +295,8 @@ test('살아 있는 잠금의 resume은 2이고 state는 보존한다', async t 
   assert.equal(await f.resume(id, { mode: 'full' }), 2);
   assert.equal(await readFile(join(dir, 'state.json'), 'utf8'), before);
 });
-test('parallel 오류 2, 빈 시나리오 skip', async t => {
-  const f = await fixture(t); assert.equal(await run({ ...f.command, parallel: true }, f.deps), 2);
+test('빈 시나리오 skip', async t => {
+  const f = await fixture(t);
   f.control.emptyQa = true;
   const { code, dir } = await f.start(); assert.equal(code, 0);
   assert.ok(!f.fake.calls.some(c => c.role === 'qa'));

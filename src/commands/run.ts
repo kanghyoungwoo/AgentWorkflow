@@ -48,7 +48,6 @@ async function execute(dir: string, deps: PipelineDeps): Promise<ExitCode> {
   }
 }
 export async function run(command: RunCommand, deps: PipelineDeps = {}): Promise<ExitCode> {
-  if (command.parallel) { console.error('--parallel은 M6에서 지원합니다.'); return 2; }
   let dir: string | undefined;
   try {
     await loadConfig(command.workspace);
@@ -70,7 +69,7 @@ export async function run(command: RunCommand, deps: PipelineDeps = {}): Promise
     const runBranch = `aw/${runId}`;
     await worktreeAdd(command.workspace, runWorktree, runBranch, baseRef);
     await writeState(dir, newRunState({
-      runId, workspace: command.workspace, mode: command.mode, parallel: false,
+      runId, workspace: command.workspace, mode: command.mode, parallel: command.parallel,
       baseRef, sinceRef, runBranch, runWorktree,
     }));
     console.log(runId);
@@ -82,6 +81,7 @@ export async function run(command: RunCommand, deps: PipelineDeps = {}): Promise
   } finally { if (dir) await releaseLock(dir); }
 }
 function loopFor(state: RunState, value: Pending): LoopState {
+  if (value.lane === 'integration') return state.integration!.loop;
   if (value.lane) return state.lanes.find(l => l.id === value.lane)!.loop;
   if (value.stage === 'WIKI') return state.wiki!;
   return state.planning;
@@ -115,12 +115,12 @@ export async function resume(command: ResumeCommand, deps: PipelineDeps = {}): P
     locked = true;
     state.scheduledResume = null;
     if (selected) {
-      const lane = state.lanes.find(l => l.id === selected!.lane);
-      if (selected.stage === 'QA') {
+      const lane = selected.lane === 'integration' ? state.integration : state.lanes.find(l => l.id === selected!.lane);
+      if (selected.stage === 'QA' || selected.stage === 'INTEGRATION_QA') {
         lane!.decisions.push(command.answer!);
         if (selected.kind === 'qa_rollback_cap') lane!.qaRollbacks = 0;
         lane!.phase = 'QA';
-      } else if (selected.stage !== 'SETUP') {
+      } else if (selected.stage !== 'SETUP' && selected.kind !== 'merge_conflict') {
         const loop = loopFor(state, selected);
         if (command.answer !== undefined) applyAnswer(loop, command.answer);
         if (command.grant) applyGrant(loop, command.grant);
@@ -135,7 +135,11 @@ export async function resume(command: ResumeCommand, deps: PipelineDeps = {}): P
       if (state.status === 'DONE') state.stage = 'LANES';
       await event(dir, deps, 'mode_switch', 'plan 런을 full 모드로 전환했습니다.');
     }
-    if (state.pending.length) {
+    for (const retry of retries) {
+      const lane = retry.lane === 'integration' ? state.integration : state.lanes.find(l => l.id === retry.lane);
+      if (lane) lane.status = 'ACTIVE';
+    }
+    if (state.pending.length && !(state.stage === 'LANES' && state.lanes.some(l => l.status === 'ACTIVE'))) {
       state.lastExitCode = pendingExit(state.pending.map(p => p.exitCode));
       await writeState(dir, state);
       return state.lastExitCode as ExitCode;
@@ -146,9 +150,13 @@ export async function resume(command: ResumeCommand, deps: PipelineDeps = {}): P
     }
     await restore(state.runWorktree, 'HEAD');
     for (const lane of state.lanes) {
-      if (lane.worktree !== state.runWorktree) await restore(lane.worktree, 'HEAD');
-      if (lane.status === 'PAUSED') lane.status = 'ACTIVE';
+      if (lane.worktree !== state.runWorktree) {
+        try { await readFile(join(lane.worktree, '.git')); await restore(lane.worktree, 'HEAD'); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      }
+      if (!state.pending.some(p => p.lane === lane.id) && lane.status === 'PAUSED') lane.status = 'ACTIVE';
     }
+    if (state.integration?.status === 'PAUSED') state.integration.status = 'ACTIVE';
     state.status = 'RUNNING'; state.lastExitCode = null;
     await writeState(dir, state);
     if (!selected) await event(dir, deps, 'resume', retries.length ? '중단된 호출을 재시도합니다.' : '런을 재개합니다.');
