@@ -31,7 +31,8 @@ async function fixture(t: import('node:test').TestContext) {
       if (args.includes('--count')) stdout = '1\n';
       return { exitCode: 0, stdout, stderr: '' };
     },
-    launchBrowser: async () => {}, client: fakeClient(() => ({ ok: true })),
+    launchBrowser: async () => {}, claudeClient: fakeClient(() => ({ ok: true })),
+    codexClient: fakeClient(() => ({ ok: true })),
     print: text => { printed = text; },
   };
   const options = { command: 'doctor' as const, workspace, deep: false, json: true };
@@ -122,7 +123,7 @@ test('app이 있을 때만 chromium을 기동하고 실패하면 fail', async t 
 test('deep는 임시 저장소의 V3, V4를 검사하고 잘못된 diff 토큰은 warn이다', async t => {
   const f = await fixture(t);
   const calls: string[] = [];
-  f.deps.client = fakeClient(async call => {
+  f.deps.claudeClient = fakeClient(async call => {
     calls.push(call.cwd);
     assert.equal(call.profile, 'readonly');
     assert.equal(call.schema && (call.schema as { additionalProperties: boolean }).additionalProperties, false);
@@ -138,7 +139,7 @@ test('deep는 임시 저장소의 V3, V4를 검사하고 잘못된 diff 토큰�
   for (const name of ['V3', 'V4']) {
     assert.equal(f.report().checks.find(check => check.name === name)?.status, 'ok');
   }
-  assert.equal(f.report().checks.find(check => check.name === 'V1')?.detail, 'M5에서 확인');
+  assert.equal(f.report().checks.some(check => check.name === 'V1'), false);
   const diffCheck = f.report().checks.find(check => check.name === 'V4 git diff');
   assert.equal(diffCheck?.status, 'warn');
   assert.match(diffCheck!.detail, /readonly 프로필에서 git diff 결과를 확인하지 못함.*wrong-token/);
@@ -154,7 +155,7 @@ test('deep의 diff 토큰은 커밋한 뒤 삭제한 줄에만 남고 일치하�
     return { exitCode: 0, stdout, stderr };
   };
   let diffCalls = 0;
-  f.deps.client = fakeClient(async call => {
+  f.deps.claudeClient = fakeClient(async call => {
     if (!call.prompt.includes('git diff HEAD')) return { ok: true };
     diffCalls++;
     assert.equal(call.profile, 'readonly');
@@ -178,7 +179,7 @@ test('deep의 diff 토큰은 커밋한 뒤 삭제한 줄에만 남고 일치하�
 test('deep 호출 실패는 V3와 V4의 detail에 error와 exitCode를 보존한다', async t => {
   const f = await fixture(t);
   const client = fakeClient(() => ({ ok: true }));
-  f.deps.client = {
+  f.deps.claudeClient = {
     run: async call => ({ ...await client.run(call), output: null, error: '호출 진단 메시지', exitCode: 7 }),
   };
   assert.equal(await doctor({ ...f.options, deep: true }, f.deps), 2);
@@ -193,7 +194,7 @@ test('deep 호출 실패는 V3와 V4의 detail에 error와 exitCode를 보존한
 });
 test('deep의 스키마 위반과 실제 파일 쓰기는 fail', async t => {
   const f = await fixture(t);
-  f.deps.client = fakeClient(async call => {
+  f.deps.claudeClient = fakeClient(async call => {
     if (call.prompt.includes('probe.txt')) {
       await writeFile(join(call.cwd, 'probe.txt'), 'unauthorized');
       return { ok: true };
@@ -205,12 +206,12 @@ test('deep의 스키마 위반과 실제 파일 쓰기는 fail', async t => {
     assert.equal(f.report().checks.find(check => check.name === name)?.status, 'fail');
   }
 });
-test('Claude 역할이 없으면 deep에서 에이전트를 호출하지 않는다', async t => {
+test('Claude 역할이 없으면 deep에서 Claude를 호출하지 않는다', async t => {
   const f = await fixture(t);
   const config = JSON.parse(await readFile(join(f.workspace, 'agent-workflow.json'), 'utf8'));
   for (const role of Object.keys(config.roles)) config.roles[role].client = 'codex';
   await writeFile(join(f.workspace, 'agent-workflow.json'), JSON.stringify(config));
-  f.deps.client = fakeClient(() => { throw new Error('호출 금지'); });
+  f.deps.claudeClient = fakeClient(() => { throw new Error('호출 금지'); });
   assert.equal(await doctor({ ...f.options, deep: true }, f.deps), 0);
   assert.equal(f.report().checks.some(check => check.name === 'V3'), false);
 });
@@ -234,5 +235,56 @@ for (const failure of ['missing', 'version', 'auth-json'] as const) {
     assert.equal(await doctor(f.options, f.deps), 2);
     assert.equal(f.report().ok, false);
     if (failure === 'missing') assert.equal(f.commands.some(command => command.includes('claude')), false);
+  });
+}
+test('Codex 역할이 있으면 V1을 임시 git 저장소에서 readonly로 호출한다', async t => {
+  const f = await fixture(t);
+  const configPath = join(f.workspace, 'agent-workflow.json');
+  const config = JSON.parse(await readFile(configPath, 'utf8'));
+  config.roles.devAuthor = { client: 'codex', model: 'custom', effort: 'high' };
+  await writeFile(configPath, JSON.stringify(config));
+  const execute = f.deps.execute;
+  const runGit = promisify(execFile);
+  f.deps.execute = async (command, args, cwd) => {
+    if (command !== 'git' || cwd === f.workspace) return execute(command, args, cwd);
+    const { stdout, stderr } = await runGit(command, args, { cwd });
+    return { exitCode: 0, stdout, stderr };
+  };
+  const client = fakeClient(async call => {
+    assert.equal(call.profile, 'readonly');
+    assert.equal(call.grant, null);
+    assert.equal(call.model, 'custom');
+    assert.equal(call.effort, 'high');
+    assert.equal(call.prompt, 'Return {"ok": true}.');
+    assert.deepEqual(call.schema, {
+      type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'], additionalProperties: false,
+    });
+    assert.notEqual(call.cwd, f.workspace);
+    assert.ok(!call.rawPrefix.startsWith(call.cwd + '/'));
+    const { stdout } = await runGit('git', ['rev-list', '--count', 'HEAD'], { cwd: call.cwd });
+    assert.equal(stdout.trim(), '1');
+    return { ok: true };
+  });
+  f.deps.codexClient = client;
+  assert.equal(await doctor({ ...f.options, deep: true }, f.deps), 0);
+  assert.equal(client.calls.length, 1);
+  assert.equal(f.report().checks.find(check => check.name === 'V1')?.status, 'ok');
+  assert.equal(f.report().checks.find(check => check.name === 'V3')?.status, 'ok');
+  await assert.rejects(readFile(join(client.calls[0].cwd, '.git', 'HEAD')), { code: 'ENOENT' });
+});
+for (const response of [
+  { output: { ok: 'true' } }, { output: { ok: true, extra: 1 } }, { output: {} },
+  { output: null, error: 'Codex 진단 메시지', exitCode: 7 },
+  { output: { ok: true }, timedOut: true },
+] as const) {
+  test(`V1 실패 판정: ${JSON.stringify(response)}`, async t => {
+    const f = await fixture(t);
+    await rm(join(f.workspace, 'agent-workflow.json'));
+    f.deps.codexClient = fakeClient([response]);
+    assert.equal(await doctor({ ...f.options, deep: true }, f.deps), 2);
+    const check = f.report().checks.find(check => check.name === 'V1');
+    assert.equal(check?.status, 'fail');
+    assert.match(check!.detail, /error: .*, exitCode: /);
+    if ('error' in response) assert.match(check!.detail, /error: Codex 진단 메시지, exitCode: 7/);
   });
 }

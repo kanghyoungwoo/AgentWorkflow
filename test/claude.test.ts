@@ -4,6 +4,7 @@ import { mkdtemp, chmod, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildClaudeArgs, extractClaudeResult, claudeClient } from '../src/clients/claude.ts';
+import { codexClient } from '../src/clients/codex.ts';
 import { profileFor, clientFor } from '../src/clients/index.ts';
 import type { AgentCall } from '../src/clients/index.ts';
 import { loadConfig } from '../src/config.ts';
@@ -53,7 +54,7 @@ test('역할 프로필과 클라이언트 선택', async () => {
   assert.equal(profileFor('wikiAuthor'), 'write');
   assert.equal(profileFor('qa'), 'qa');
   const { config } = await loadConfig('/tmp/aw-missing-config-directory');
-  assert.throws(() => clientFor(config, 'devAuthor'), /codex 어댑터는 아직 없음/);
+  assert.equal(clientFor(config, 'devAuthor'), codexClient);
   assert.equal(clientFor(config, 'qa'), claudeClient);
 });
 test('Claude 실행 예외의 원래 메시지를 error에 보존한다', async t => {

@@ -1,5 +1,6 @@
 import type { Role, WorkspaceConfig } from '../types.ts';
 import { claudeClient } from './claude.ts';
+import { codexClient } from './codex.ts';
 
 export type Profile = 'readonly' | 'write' | 'qa';
 export type AgentCall = {
@@ -33,6 +34,6 @@ export function profileFor(role: Role): Profile {
   return role === 'devAuthor' || role === 'wikiAuthor' ? 'write' : 'readonly';
 }
 export function clientFor(config: WorkspaceConfig, role: Role): AgentClient {
-  if (config.roles[role].client === 'codex') throw new Error('codex 어댑터는 아직 없음');
+  if (config.roles[role].client === 'codex') return codexClient;
   return claudeClient;
 }

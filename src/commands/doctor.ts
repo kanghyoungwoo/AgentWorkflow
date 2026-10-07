@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { Ajv } from 'ajv';
 import { loadConfig } from '../config.ts';
 import { claudeClient } from '../clients/claude.ts';
+import { codexClient } from '../clients/codex.ts';
 import { resolveExecutable, spawnProcess } from '../clients/spawn.ts';
 import type { AgentClient } from '../clients/index.ts';
 import type { CommandLine } from '../cli.ts';
@@ -16,7 +17,8 @@ export type DoctorDependencies = {
   execute: (command: string, args: string[], cwd: string) => Promise<CommandResult>;
   resolve: (name: string) => Promise<string | null>;
   launchBrowser: () => Promise<void>;
-  client: AgentClient;
+  claudeClient: AgentClient;
+  codexClient: AgentClient;
   nodeVersion: string;
   print: (text: string) => void;
 };
@@ -38,7 +40,7 @@ async function execute(command: string, args: string[], cwd: string): Promise<Co
   }
 }
 const defaults: DoctorDependencies = {
-  execute, resolve: resolveExecutable, client: claudeClient, nodeVersion: process.versions.node,
+  execute, resolve: resolveExecutable, claudeClient, codexClient, nodeVersion: process.versions.node,
   print: text => console.log(text),
   launchBrowser: async () => {
     const { chromium } = await import('playwright');
@@ -49,8 +51,6 @@ const defaults: DoctorDependencies = {
 async function deepChecks(
   config: WorkspaceConfig, deps: DoctorDependencies, checks: Check[],
 ): Promise<void> {
-  checks.push({ name: 'V1', status: 'warn', detail: 'M5에서 확인' });
-  if (!Object.values(config.roles).some(role => role.client === 'claude')) return;
   const dir = await mkdtemp(join(tmpdir(), 'aw-doctor-deep-'));
   const cwd = join(dir, 'repo');
   try {
@@ -62,17 +62,32 @@ async function deepChecks(
       const result = await deps.execute('git', args, cwd);
       if (result.exitCode !== 0) throw new Error('임시 git 저장소를 준비할 수 없습니다.');
     }
-    const role = Object.values(config.roles).find(value => value.client === 'claude')!;
     const base = {
       role: 'planningAuthor' as const, profile: 'readonly' as const, grant: null, cwd,
-      qaDir: null, model: role.model, effort: role.effort, timeoutMs: config.limits.stepTimeoutMin * 60000,
+      qaDir: null, model: null, effort: null, timeoutMs: config.limits.stepTimeoutMin * 60000,
     };
     const schema = {
       type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'], additionalProperties: false,
     };
     const ajv = new Ajv();
-    const v3 = await deps.client.run({
-      ...base, schema, prompt: 'Return {"ok": true}.', rawPrefix: join(dir, 'v3'),
+    const codexRole = Object.values(config.roles).find(role => role.client === 'codex');
+    if (codexRole) {
+      const v1 = await deps.codexClient.run({
+        ...base, model: codexRole.model, effort: codexRole.effort,
+        schema, prompt: 'Return {"ok": true}.', rawPrefix: join(dir, 'v1'),
+      });
+      const valid = !v1.error && !v1.timedOut && v1.exitCode === 0 && ajv.validate(schema, v1.output);
+      checks.push({
+        name: 'V1', status: valid ? 'ok' : 'fail',
+        detail: 'Codex JSON 스키마 출력 검사'
+          + (valid ? '' : ` (error: ${v1.error}, exitCode: ${v1.exitCode})`),
+      });
+    }
+    const claudeRole = Object.values(config.roles).find(role => role.client === 'claude');
+    if (!claudeRole) return;
+    const claudeBase = { ...base, model: claudeRole.model, effort: claudeRole.effort };
+    const v3 = await deps.claudeClient.run({
+      ...claudeBase, schema, prompt: 'Return {"ok": true}.', rawPrefix: join(dir, 'v3'),
     });
     const v3Valid = !v3.error && v3.exitCode === 0 && ajv.validate(schema, v3.output);
     checks.push({
@@ -80,8 +95,8 @@ async function deepChecks(
       detail: 'Claude JSON 스키마 출력 검사'
         + (v3Valid ? '' : ` (error: ${v3.error}, exitCode: ${v3.exitCode})`),
     });
-    const v4 = await deps.client.run({
-      ...base, schema, rawPrefix: join(dir, 'v4'),
+    const v4 = await deps.claudeClient.run({
+      ...claudeBase, schema, rawPrefix: join(dir, 'v4'),
       prompt: 'Try to write probe.txt in this repository. Return {"ok": true}.',
     });
     const status = await deps.execute('git', ['status', '--porcelain'], cwd);
@@ -112,8 +127,8 @@ async function deepChecks(
     const tokenSchema = {
       type: 'object', properties: { token: { type: 'string' } }, required: ['token'], additionalProperties: false,
     };
-    const diff = await deps.client.run({
-      ...base, schema: tokenSchema, rawPrefix: join(dir, 'v4-diff'),
+    const diff = await deps.claudeClient.run({
+      ...claudeBase, schema: tokenSchema, rawPrefix: join(dir, 'v4-diff'),
       prompt: 'Run `git diff HEAD` with the Bash tool and return the text of the removed line as token.',
     });
     const diffValid = !diff.error && diff.exitCode === 0 && ajv.validate(tokenSchema, diff.output)
