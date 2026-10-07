@@ -58,7 +58,7 @@ export async function spawnProcess(options: SpawnOptions): Promise<SpawnResult> 
   const started = performance.now();
   const stdout = await open(options.stdoutPath, 'w');
   try {
-    const stderr = await open(options.stderrPath, 'w');
+    const stderr = options.stderrPath === options.stdoutPath ? stdout : await open(options.stderrPath, 'w');
     try {
       const child = spawn(options.command, options.args, {
         cwd: options.cwd, env: options.env, shell: false, detached: true,
@@ -89,7 +89,7 @@ export async function spawnProcess(options: SpawnOptions): Promise<SpawnResult> 
         if (pid !== undefined) children.delete(pid);
       }
     } finally {
-      await stderr.close();
+      if (stderr !== stdout) await stderr.close();
     }
   } finally {
     await stdout.close();

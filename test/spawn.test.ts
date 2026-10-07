@@ -90,3 +90,15 @@ test('없는 실행 파일은 거부되며 raw 파일은 닫힌다', async t => 
     stdoutPath: join(cwd, 'out'), stderrPath: join(cwd, 'err'),
   }), { code: 'ENOENT' });
 });
+
+test('stdoutPath와 stderrPath가 같으면 두 출력을 한 파일에 저장한다', async t => {
+  const cwd = await temp(t);
+  const logPath = join(cwd, 'combined.log');
+  await writeFile(logPath, '이전 로그');
+  const result = await spawnProcess({
+    command: 'sh', args: ['-c', 'printf "stdout\\n"; printf "stderr\\n" >&2; printf "last\\n"'],
+    cwd, stdin: '', timeoutMs: 1000, stdoutPath: logPath, stderrPath: logPath,
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(await readFile(logPath, 'utf8'), 'stdout\nstderr\nlast\n');
+});
