@@ -1,3 +1,4 @@
+import { doctor } from './commands/doctor.ts';
 import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
 import { isValidSlug } from './store/runlog.ts';
@@ -211,7 +212,9 @@ export function parseCommandLine(argv: string[]): ParseResult {
     };
   }
 }
-const handlers: Partial<Record<CommandLine['command'], (command: CommandLine) => Promise<ExitCode>>> = {};
+const handlers: Partial<Record<CommandLine['command'], (command: CommandLine) => Promise<ExitCode>>> = {
+  doctor: command => doctor(command as Extract<CommandLine, { command: 'doctor' }>),
+};
 export async function main(argv: string[]): Promise<ExitCode> {
   const parsed = parseCommandLine(argv);
   if (!parsed.ok) {

@@ -77,6 +77,6 @@ test('main: 인자 오류와 미구현 명령은 stderr와 2', async t => {
   assert.match(stderr.pop()!, /사용법/);
   assert.equal(await main(['run', '--mode', 'full']), 2);
   assert.match(stderr.pop()!, /--request-file.*\n사용법/s);
-  assert.equal(await main(['doctor']), 2);
-  assert.equal(stderr.pop(), '아직 구현되지 않은 명령입니다: doctor');
+  assert.equal(await main(['list']), 2);
+  assert.equal(stderr.pop(), '아직 구현되지 않은 명령입니다: list');
 });
