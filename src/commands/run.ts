@@ -8,17 +8,19 @@ import { runPipeline, pendingExit } from '../engine/pipeline.ts';
 import type { PipelineDeps } from '../engine/pipeline.ts';
 import { applyAnswer, applyGrant } from '../engine/review-loop.ts';
 import { acquireLock, newRunState, readLock, readState, releaseLock, writeState } from '../store/state.ts';
-import { appendEvent, initRunDir, makeRunId, runDir as directoryFor } from '../store/runlog.ts';
+import { appendEvent, initRunDir, makeRunId, printEvent, runDir as directoryFor } from '../store/runlog.ts';
+import { atAvailable, scheduleResume, cancelResume } from '../schedule.ts';
 import { parseRequest } from '../store/request.ts';
 import type { ExitCode, LoopState, Pending, RunEvent, RunState } from '../types.ts';
 
+export type RunDeps = PipelineDeps & {
+  atAvailable?: typeof atAvailable;
+  scheduleResume?: typeof scheduleResume;
+  cancelResume?: typeof cancelResume;
+};
 type RunCommand = Extract<CommandLine, { command: 'run' }>;
 type ResumeCommand = Extract<CommandLine, { command: 'resume' }>;
-function printEvent(event: RunEvent): void {
-  console.log(`${event.at} ${event.lane ?? 'run'} ${event.stage ?? '-'} `
-    + `${event.role ?? '-'} ${event.type} ${event.verdict ?? '-'} ${event.message.replace(/\r?\n/g, ' ')}`);
-}
-async function event(dir: string, deps: PipelineDeps, type: RunEvent['type'], message: string) {
+async function event(dir: string, deps: RunDeps, type: RunEvent['type'], message: string) {
   const value: RunEvent = {
     at: (deps.now?.() ?? new Date()).toISOString(), lane: null, stage: null, role: null,
     type, verdict: null, round: null, message,
@@ -26,7 +28,7 @@ async function event(dir: string, deps: PipelineDeps, type: RunEvent['type'], me
   await appendEvent(dir, value);
   (deps.onEvent ?? printEvent)(value);
 }
-async function execute(dir: string, deps: PipelineDeps): Promise<ExitCode> {
+async function execute(dir: string, deps: RunDeps): Promise<ExitCode> {
   let interrupted = false;
   let killing: Promise<void> | undefined;
   const signal = () => {
@@ -40,6 +42,7 @@ async function execute(dir: string, deps: PipelineDeps): Promise<ExitCode> {
       ...deps, onEvent: deps.onEvent ?? printEvent, interrupted: () => interrupted || !!deps.interrupted?.(),
     });
     await killing;
+    await schedulePending(dir, deps);
     return result;
   } finally {
     process.off('SIGINT', signal);
@@ -47,7 +50,7 @@ async function execute(dir: string, deps: PipelineDeps): Promise<ExitCode> {
     await releaseLock(dir);
   }
 }
-export async function run(command: RunCommand, deps: PipelineDeps = {}): Promise<ExitCode> {
+export async function run(command: RunCommand, deps: RunDeps = {}): Promise<ExitCode> {
   let dir: string | undefined;
   try {
     await loadConfig(command.workspace);
@@ -86,7 +89,7 @@ function loopFor(state: RunState, value: Pending): LoopState {
   if (value.stage === 'WIKI') return state.wiki!;
   return state.planning;
 }
-export async function resume(command: ResumeCommand, deps: PipelineDeps = {}): Promise<ExitCode> {
+export async function resume(command: ResumeCommand, deps: RunDeps = {}): Promise<ExitCode> {
   let dir: string | undefined;
   let locked = false;
   try {
@@ -94,8 +97,10 @@ export async function resume(command: ResumeCommand, deps: PipelineDeps = {}): P
     dir = directoryFor(command.workspace, command.runId);
     if ((await readLock(dir))?.alive) throw new Error('이미 실행 중입니다.');
     const state = await readState(dir);
-    await loadConfig(command.workspace);
     if (state.workspace !== command.workspace) throw new Error('런 워크스페이스가 일치하지 않습니다.');
+    await acquireLock(dir);
+    locked = true;
+    await loadConfig(command.workspace);
     if (command.mode && state.mode !== 'plan') throw new Error('--mode full은 plan 런에만 사용할 수 있습니다.');
     const manual = state.pending.filter(p => p.kind !== 'failed' && p.kind !== 'rate_limited');
     let selected: Pending | undefined;
@@ -111,9 +116,6 @@ export async function resume(command: ResumeCommand, deps: PipelineDeps = {}): P
         throw new Error('이 Pending에는 --answer가 필요합니다.');
       }
     } else if (command.lane !== undefined) throw new Error('--lane에는 --answer 또는 --grant가 필요합니다.');
-    await acquireLock(dir);
-    locked = true;
-    state.scheduledResume = null;
     if (selected) {
       const lane = selected.lane === 'integration' ? state.integration : state.lanes.find(l => l.id === selected!.lane);
       if (selected.stage === 'QA' || selected.stage === 'INTEGRATION_QA') {
@@ -148,6 +150,11 @@ export async function resume(command: ResumeCommand, deps: PipelineDeps = {}): P
       await writeState(dir, state);
       return 0;
     }
+    if (state.scheduledResume) {
+      await (deps.cancelResume ?? cancelResume)(state.scheduledResume.atJobId);
+      state.scheduledResume = null;
+      await writeState(dir, state);
+    }
     await restore(state.runWorktree, 'HEAD');
     for (const lane of state.lanes) {
       if (lane.worktree !== state.runWorktree) {
@@ -165,4 +172,24 @@ export async function resume(command: ResumeCommand, deps: PipelineDeps = {}): P
     console.error(String(error));
     return 2;
   } finally { if (dir && locked) await releaseLock(dir); }
+}
+
+export async function schedulePending(dir: string, deps: RunDeps = {}): Promise<void> {
+  const state = await readState(dir);
+  const limited = state.pending.filter(p => p.kind === 'rate_limited');
+  if (!limited.length) return;
+  const times = limited.map(p => p.resetAt ? Date.parse(p.resetAt) : NaN).filter(Number.isFinite);
+  let message = '리셋 시각이 없어 resume을 예약하지 않았습니다.';
+  if (times.length) {
+    if (await (deps.atAvailable ?? atAvailable)()) {
+      state.scheduledResume = await (deps.scheduleResume ?? scheduleResume)({
+        runId: state.runId, workspace: state.workspace, at: new Date(Math.max(...times) + 120_000),
+      });
+      message = state.scheduledResume
+        ? `resume 예약: ${state.scheduledResume.at} (작업 ${state.scheduledResume.atJobId})`
+        : 'at 등록에 실패하여 resume을 예약하지 않았습니다.';
+      await writeState(dir, state);
+    } else message = 'at 또는 atd를 사용할 수 없어 resume을 예약하지 않았습니다.';
+  }
+  await event(dir, deps, 'schedule', message);
 }

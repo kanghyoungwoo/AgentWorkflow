@@ -303,7 +303,7 @@ type RunEvent = {
   role: Role | null;        // 오케스트레이터가 낸 이벤트는 null
   type: "run_start" | "setup" | "author" | "gate" | "tests" | "review" | "qa" | "skip"
       | "pause" | "resume" | "rate_limit" | "schedule" | "merge" | "commit"
-      | "mode_switch" | "renumber" | "done";
+      | "mode_switch" | "renumber" | "done" | "cleanup";
   verdict: string | null;   // READY, DONE, BLOCKED, PASS, FAIL, APPROVED, REJECTED 등 판정이 있는 이벤트만
   round: number | null;     // 라운드 번호 또는 QA attempt
   message: string;          // 한국어 한 줄

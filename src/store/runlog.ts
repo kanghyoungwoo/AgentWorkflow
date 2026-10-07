@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import type { RunEvent, Role } from '../types.ts';
 
 const pad = (n: number, width = 2) => String(n).padStart(width, '0');
-function localTime(date: Date): string {
+export function localTime(date: Date): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
     + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
@@ -84,4 +84,15 @@ export async function appendEvent(dir: string, event: RunEvent): Promise<void> {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
   }
   await appendFile(join(dir, 'timeline.md'), renderRow(event));
+}
+
+export function formatEvent(event: RunEvent): string {
+  return `${localTime(new Date(event.at))} ${event.lane ?? 'run'} ${event.stage ?? '-'} `
+    + `${event.role ?? '-'} ${event.type} ${event.verdict ?? '-'} ${event.message.replace(/\r\n|\r|\n/g, ' ')}`;
+}
+export function printEvent(event: RunEvent): void {
+  console.log(formatEvent(event));
+}
+export function validateRunId(runId: string): void {
+  if (!/^[a-zA-Z0-9_-]+$/.test(runId)) throw new Error('잘못된 run-id입니다.');
 }

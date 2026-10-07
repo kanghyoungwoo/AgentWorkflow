@@ -9,7 +9,7 @@ import type { AgentCall, AgentResult } from '../src/clients/index.ts';
 import type { Plan, QaReport, Role } from '../src/types.ts';
 import { run, resume } from '../src/commands/run.ts';
 import { runPipeline } from '../src/engine/pipeline.ts';
-import type { PipelineDeps } from '../src/engine/pipeline.ts';
+import type { RunDeps } from '../src/commands/run.ts';
 import { readEvents } from '../src/store/runlog.ts';
 import { readState, writeState } from '../src/store/state.ts';
 import { headSha, commitAll } from '../src/git.ts';
@@ -95,7 +95,8 @@ async function fixture(t: TestContext, options: {
       docs: ['index.md', 'log.md'].map(name => ({ path: `docs/wiki/${name}`, action: 'created', reason: '기록' })),
     };
   });
-  const deps: PipelineDeps = {
+  const deps: RunDeps = {
+    atAvailable: async () => false,
     now: () => new Date('2026-10-07T01:02:03Z'), onEvent: () => {},
     clientFor: () => ({
       async run(call) {
@@ -533,3 +534,40 @@ for (const kind of ['failed', 'rate_limited', 'BLOCKED'] as const) {
     if (kind === 'BLOCKED') assert.ok(event.message.startsWith('시나리오 0/1 PASS, 결함 없음'));
   });
 }
+
+for (const resetAt of ['2026-10-08T00:00:00Z', null]) {
+  test(`한도 예약 불가 기록: resetAt=${resetAt}`, async t => {
+    const f = await fixture(t);
+    f.failTransport({ rateLimited: true, resetAt }, 1);
+    f.deps.scheduleResume = async () => { assert.fail('예약하지 않아야 합니다.'); };
+    const { code, dir } = await f.start();
+    assert.equal(code, 22);
+    assert.equal((await readState(dir)).scheduledResume, null);
+    const scheduled = (await readEvents(dir)).find(e => e.type === 'schedule')!;
+    assert.ok(scheduled.message.includes(resetAt ? 'at 또는 atd' : '리셋 시각이 없어'));
+  });
+}
+test('at 등록 실패도 기존 한도 종료 코드를 유지', async t => {
+  const f = await fixture(t);
+  f.failTransport({ rateLimited: true, resetAt: '2026-10-08T00:00:00Z' }, 1);
+  f.deps.atAvailable = async () => true;
+  f.deps.scheduleResume = async () => null;
+  const { code, dir } = await f.start();
+  assert.equal(code, 22);
+  assert.equal((await readState(dir)).scheduledResume, null);
+  assert.ok((await readEvents(dir)).some(e => e.type === 'schedule' && e.message.includes('등록에 실패')));
+});
+
+test('resume 설정 로드 실패 시 기존 예약 보존', async t => {
+  const f = await fixture(t, { mode: 'plan' });
+  const { dir, id } = await f.start();
+  const state = await readState(dir);
+  state.scheduledResume = { atJobId: 42, at: '2026-10-08T00:00:00Z' };
+  await writeState(dir, state);
+  const canceled: number[] = [];
+  f.deps.cancelResume = async job => { canceled.push(job); };
+  await writeFile(join(f.cwd, 'agent-workflow.json'), 'invalid');
+  assert.equal(await f.resume(id), 2);
+  assert.deepEqual(canceled, []);
+  assert.deepEqual((await readState(dir)).scheduledResume, state.scheduledResume);
+});

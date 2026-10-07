@@ -75,8 +75,8 @@ export async function addExcludes(workspace: string, patterns: string[]): Promis
 export async function worktreeAdd(workspace: string, path: string, branch: string, startPoint: string): Promise<void> {
   await git(workspace, ['worktree', 'add', '-b', branch, path, startPoint]);
 }
-export async function worktreeRemove(workspace: string, path: string): Promise<void> {
-  await git(workspace, ['worktree', 'remove', path]);
+export async function worktreeRemove(workspace: string, path: string, force = false): Promise<void> {
+  await git(workspace, ['worktree', 'remove', ...(force ? ['--force'] : []), path]);
 }
 export async function branchDelete(workspace: string, branch: string): Promise<void> {
   await git(workspace, ['branch', '-D', branch]);
@@ -116,4 +116,12 @@ export async function merge(
     await git(cwd, ['merge', '--abort']);
     return { ok: false, conflicts };
   }
+}
+
+export async function worktreePrune(workspace: string): Promise<void> {
+  await git(workspace, ['worktree', 'prune']);
+}
+export async function laneBranches(workspace: string, runId: string): Promise<string[]> {
+  return (await git(workspace, ['for-each-ref', '--format=%(refname:short)', `refs/heads/aw/${runId}-lane-*`]))
+    .split('\n').filter(Boolean);
 }

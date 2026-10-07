@@ -70,13 +70,13 @@ for (const argv of [
   assert.equal(result.ok, false);
   if (!result.ok) assert.match(result.error, /인자 오류/);
 });
-test('main: 인자 오류와 미구현 명령은 stderr와 2', async t => {
+test('main: 인자 오류는 stderr와 2, list 핸들러 등록', async t => {
   const stderr: string[] = [];
   t.mock.method(console, 'error', (text: string) => stderr.push(text));
   assert.equal(await main([]), 2);
   assert.match(stderr.pop()!, /사용법/);
   assert.equal(await main(['run', '--mode', 'full']), 2);
   assert.match(stderr.pop()!, /--request-file.*\n사용법/s);
-  assert.equal(await main(['list']), 2);
-  assert.equal(stderr.pop(), '아직 구현되지 않은 명령입니다: list');
+  t.mock.method(console, 'log', () => {});
+  assert.equal(await main(['list', '--workspace', '/tmp/aw-no-runs', '--json']), 0);
 });

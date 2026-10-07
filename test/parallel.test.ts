@@ -8,7 +8,7 @@ import type { TestContext } from 'node:test';
 import type { AgentCall } from '../src/clients/index.ts';
 import type { BlockerKind, Plan, QaScenario, Role } from '../src/types.ts';
 import { run, resume } from '../src/commands/run.ts';
-import type { PipelineDeps } from '../src/engine/pipeline.ts';
+import type { RunDeps } from '../src/commands/run.ts';
 import { commitAll, headSha, resolveRef } from '../src/git.ts';
 import { readEvents } from '../src/store/runlog.ts';
 import { readState } from '../src/store/state.ts';
@@ -130,7 +130,8 @@ async function fixture(t: TestContext, options: {
       docs: [{ path: 'docs/wiki/log.md', action: 'created', reason: '기록' }],
     };
   });
-  const deps: PipelineDeps = {
+  const deps: RunDeps = {
+    atAvailable: async () => false,
     now: () => new Date('2026-10-07T01:02:03Z'), onEvent: () => {}, clientFor: () => fake,
   };
   const start = async () => {
@@ -424,4 +425,42 @@ test('한 레인 failed와 다른 수동 Pending을 함께 재개하고 종료 �
   fail = false;
   delete f.control.blocked.b;
   assert.equal(await f.resume(id, { lane: 'b', answer: '재개' }), 0);
+});
+
+test('두 레인 한도: 늦은 resetAt +2분 단일 예약, resume 해제와 재예약', async t => {
+  const f = await fixture(t);
+  const limited = fakeClient([
+    { rateLimited: true, resetAt: '2026-10-08T00:00:00Z' },
+    { rateLimited: true, resetAt: '2026-10-08T01:00:00Z' },
+    { rateLimited: true, resetAt: '2026-10-09T02:00:00Z' },
+    { rateLimited: true, resetAt: '2026-10-09T03:00:00Z' },
+  ]);
+  f.deps.clientFor = () => ({ run: call => call.role === 'devAuthor' ? limited.run(call) : f.fake.run(call) });
+  const scheduled: string[] = [];
+  const canceled: number[] = [];
+  f.deps.atAvailable = async () => true;
+  f.deps.scheduleResume = async options => {
+    scheduled.push(options.at.toISOString());
+    return { atJobId: 12 + scheduled.length, at: options.at.toISOString() };
+  };
+  f.deps.cancelResume = async id => { canceled.push(id); };
+  const { code, dir, id } = await f.start();
+  assert.equal(code, 22);
+  assert.equal((await readState(dir)).pending.length, 2);
+  assert.deepEqual(scheduled, ['2026-10-08T01:02:00.000Z']);
+  assert.deepEqual((await readState(dir)).scheduledResume, { atJobId: 13, at: scheduled[0] });
+  const before = await readState(dir);
+  for (const args of [
+    { lane: 'missing' }, { lane: 'missing', answer: '진행' },
+    { answer: '진행' }, { grant: 'network' as const }, { mode: 'full' as const },
+  ]) {
+    assert.equal(await resume({ command: 'resume', workspace: before.workspace, runId: id, ...args }, f.deps), 2);
+    assert.deepEqual(canceled, []);
+    assert.deepEqual(await readState(dir), before);
+  }
+  assert.equal(await f.resume(id), 22);
+  assert.deepEqual(canceled, [13]);
+  assert.deepEqual(scheduled, ['2026-10-08T01:02:00.000Z', '2026-10-09T03:02:00.000Z']);
+  assert.deepEqual((await readState(dir)).scheduledResume, { atJobId: 14, at: scheduled[1] });
+  assert.equal((await readEvents(dir)).filter(e => e.type === 'schedule').length, 2);
 });

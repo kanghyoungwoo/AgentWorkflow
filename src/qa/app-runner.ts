@@ -14,12 +14,15 @@ export async function portForSlot(slot: number, maxLanes: number, home = homedir
   const port = runtime.basePort + slot;
   if (!Number.isInteger(slot) || slot < 0 || slot >= runtime.slots
     || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error('QA 포트 슬롯이 범위 밖입니다.');
+  await checkPort(port);
+  return port;
+}
+export async function checkPort(port: number): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const server = createServer();
     server.once('error', error => reject(new Error(`QA 포트 ${port}를 사용할 수 없습니다: ${error.message}`)));
     server.listen(port, '127.0.0.1', () => server.close(error => error ? reject(error) : resolve()));
   });
-  return port;
 }
 export type AppHandle = { pid: number };
 export async function startApp(options: {

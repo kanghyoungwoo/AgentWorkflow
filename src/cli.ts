@@ -1,4 +1,7 @@
 import { run, resume } from './commands/run.ts';
+import { status, logs, list, watch } from './commands/inspect.ts';
+import { cleanup } from './commands/cleanup.ts';
+import { setupQaRuntime } from './commands/qa-runtime.ts';
 import { doctor } from './commands/doctor.ts';
 import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
@@ -213,10 +216,16 @@ export function parseCommandLine(argv: string[]): ParseResult {
     };
   }
 }
-const handlers: Partial<Record<CommandLine['command'], (command: CommandLine) => Promise<ExitCode>>> = {
+const handlers: Record<CommandLine['command'], (command: CommandLine) => Promise<ExitCode>> = {
   run: command => run(command as Extract<CommandLine, { command: 'run' }>),
   resume: command => resume(command as Extract<CommandLine, { command: 'resume' }>),
   doctor: command => doctor(command as Extract<CommandLine, { command: 'doctor' }>),
+  status: command => status(command as Extract<CommandLine, { command: 'status' }>),
+  logs: command => logs(command as Extract<CommandLine, { command: 'logs' }>),
+  list: command => list(command as Extract<CommandLine, { command: 'list' }>),
+  watch: command => watch(command as Extract<CommandLine, { command: 'watch' }>),
+  cleanup: command => cleanup(command as Extract<CommandLine, { command: 'cleanup' }>),
+  'qa-runtime setup': command => setupQaRuntime(command as Extract<CommandLine, { command: 'qa-runtime setup' }>),
 };
 export async function main(argv: string[]): Promise<ExitCode> {
   const parsed = parseCommandLine(argv);
@@ -225,9 +234,5 @@ export async function main(argv: string[]): Promise<ExitCode> {
     return EXIT_CODES.USAGE;
   }
   const handler = handlers[parsed.command];
-  if (!handler) {
-    console.error(`아직 구현되지 않은 명령입니다: ${parsed.command}`);
-    return EXIT_CODES.USAGE;
-  }
   return handler(parsed);
 }

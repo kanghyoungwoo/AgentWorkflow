@@ -29,7 +29,7 @@ export type RunEvent = {
   role: Role | null;
   type: "run_start" | "setup" | "author" | "gate" | "tests" | "review" | "qa" | "skip"
     | "pause" | "resume" | "rate_limit" | "schedule" | "merge" | "commit"
-    | "mode_switch" | "renumber" | "done";
+    | "mode_switch" | "renumber" | "done" | "cleanup";
   verdict: string | null;
   round: number | null;
   message: string;
