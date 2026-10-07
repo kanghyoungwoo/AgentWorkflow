@@ -184,11 +184,14 @@ AgentWorkflow/
 │  ├─ wiki-author.schema.json
 │  └─ config.schema.json
 ├─ skill/agent-workflow/SKILL.md  Master 스킬
+├─ fixtures/sample-app/         임시 git 저장소로 복사해 쓰는 샘플(의존성 없는 메모 웹앱 + 테스트)
+│                               test/ 밖에 둠: 인자 없는 `node --test`가 test/ 아래 .mjs를 테스트로 실행하기 때문
 └─ test/                        node --test
    ├─ fake-client.ts            스크립트된 응답을 돌려주는 테스트용 AgentClient
-   ├─ *.test.ts
-   └─ fixtures/                 임시 git 저장소용 샘플(작은 정적 웹앱 + CLI)
+   └─ *.test.ts
 ```
+
+M4·M5·M8 실제 실행용 요청은 `fixtures/sample-app`에 "메모 검색 필터"(입력한 글자로 목록을 거르고, 결과가 없으면 "결과 없음" 표시, REQ 2~3개)를 추가하는 것입니다(2026-10-07 사용자 승인).
 
 전역 상태: `~/.agent-workflow/qa-runtime.json`(포트 슬롯).
 
