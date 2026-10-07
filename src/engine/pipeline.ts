@@ -466,7 +466,8 @@ export async function runPipeline(runDir: string, deps: PipelineDeps = {}): Prom
             }
             for (const scenario of result.output.qaScenarios) {
               const id = nextId('QA', plan!.qaScenarios.map(s => s.id));
-              plan!.qaScenarios.push({ ...scenario, id, lane: lane.id === 'main' ? null : lane.id });
+              const scenarioLane = lane.id === 'main' || lane.id === 'integration' ? null : lane.id;
+              plan!.qaScenarios.push({ ...scenario, id, lane: scenarioLane });
               if (scenario.id !== id) await emitUnlocked(ctx, 'renumber', `${scenario.id} → ${id}`);
             }
             await savePlanUnlocked(ctx);

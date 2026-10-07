@@ -297,7 +297,7 @@ for (const testFailure of [true, false]) {
     assert.ok(await readFile(join(dir, '02-development/integration/fix-1/round-01.author.json')));
     const output: Plan = JSON.parse(await readFile(join(dir, '01-planning/plan.json'), 'utf8'));
     assert.equal(output.todos.find(todo => todo.id === 'FIX-001')!.lane, 'integration');
-    assert.equal(output.qaScenarios.at(-1)!.lane, 'integration');
+    assert.equal(output.qaScenarios.at(-1)!.lane, null);
     const qaCalls = f.fake.calls.filter(c => c.role === 'qa'
       && section<{ scope: string }>(c, 'Run context').scope === 'integration');
     assert.equal(qaCalls.length, testFailure ? 1 : 2);
@@ -314,6 +314,7 @@ test('동시 FIX 승인에도 전역 FIX/QA id와 레인 todo는 겹치지 않�
   assert.deepEqual(output.todos.filter(todo => todo.id.startsWith('FIX')).map(todo => todo.id),
     ['FIX-001', 'FIX-002']);
   assert.equal(new Set(output.qaScenarios.map(s => s.id)).size, output.qaScenarios.length);
+  assert.deepEqual(output.qaScenarios.slice(3).map(s => s.lane).sort(), ['a', 'b']);
   for (const lane of ['a', 'b']) {
     const todos = output.todos.filter(todo => todo.lane === lane);
     const text = await readFile(join(dir, `02-development/${lane}/todo.md`), 'utf8');
