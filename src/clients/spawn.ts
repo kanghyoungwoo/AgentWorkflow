@@ -5,6 +5,8 @@ import { delimiter, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const children = new Set<number>();
+export function trackChild(pid: number): void { children.add(pid); }
+export function untrackChild(pid: number): void { children.delete(pid); }
 export async function resolveExecutable(name: string): Promise<string | null> {
   const candidates = name.includes('/') ? [resolve(name)]
     : (process.env.PATH ?? '').split(delimiter).map(dir => resolve(dir || '.', name));

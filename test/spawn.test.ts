@@ -31,7 +31,7 @@ async function stopped(pid: number): Promise<boolean> {
     const status = await readFile(`/proc/${pid}/stat`, 'utf8');
     return status.slice(status.lastIndexOf(')') + 2).startsWith('Z');
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    if (['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) return true;
     throw error;
   }
 }

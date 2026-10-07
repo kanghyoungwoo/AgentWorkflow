@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { BlockerKind, PlanAuthorOutput, ReviewOutput, RunEvent } from '../src/types.ts';
+import type { BlockerKind, PlanAuthorOutput, ReviewOutput, RunEvent, WikiAuthorOutput } from '../src/types.ts';
 import type { InvokeOutcome } from '../src/engine/invoke.ts';
 import { applyAnswer, applyGrant, runReviewLoop } from '../src/engine/review-loop.ts';
-import { finding, loopState, plan, review } from './engine-fixtures.ts';
+import { dev, finding, loopState, plan, review } from './engine-fixtures.ts';
 
 const limits = { sameIssueLimit: 2, maxReviewRounds: 5 };
 const ok = <T>(output: T): InvokeOutcome<T> => ({ kind: 'ok', output });
@@ -20,6 +20,7 @@ test('게이트 통과 후 검수 승인과 이벤트', async () => {
   assert.equal(loop.round, 1);
   assert.equal(loop.judgedRounds, 0);
   assert.deepEqual(events.map(e => e.type), ['author', 'gate', 'review']);
+  assert.deepEqual(events.map(e => e.message), ['계획', '통과', '검수']);
 });
 for (const source of ['gate', 'review'] as const) {
   test(`${source} 반려 후 다음 라운드 승인`, async () => {
@@ -66,13 +67,15 @@ for (const kind of [
   test(`작업 BLOCKED ${kind}`, async () => {
     const loop = loopState();
     const previous = plan();
+    const events: Omit<RunEvent, 'at'>[] = [];
     loop.lastOutput = previous;
     loop.judgedRounds = 1;
     loop.issueStreak = { 'R-001': 1 };
     const result = await runReviewLoop(loop, limits, {
       author: async () => ok({ ...plan(), status: 'BLOCKED', blocker: { kind, detail: '필요한 이유' } }),
       gates: async () => { assert.fail('BLOCKED에는 게이트 없음'); },
-      review: async () => { assert.fail('BLOCKED에는 검수 없음'); }, emit: async () => {},
+      review: async () => { assert.fail('BLOCKED에는 검수 없음'); },
+      emit: async event => { events.push(event); },
     });
     assert.equal(result.kind, 'paused');
     if (result.kind === 'paused') {
@@ -80,6 +83,7 @@ for (const kind of [
       assert.equal(result.pending.exitCode, kind === 'permission_full' ? 21 : 20);
       assert.equal(result.pending.detail, '필요한 이유');
     }
+    assert.equal(events[0].message, `${kind}: 필요한 이유`);
     assert.equal(loop.judgedRounds, 1);
     assert.equal(loop.lastOutput, previous);
     assert.deepEqual(loop.issueStreak, { 'R-001': 1 });
@@ -108,6 +112,7 @@ for (const source of ['author', 'review'] as const) {
       }
       assert.deepEqual({ ...loop, round: 0 }, previous);
       assert.equal(events.at(-1)!.type, 'pause');
+      assert.equal(events.find(event => event.type === source)!.message, outcome.detail);
     });
   }
 }
@@ -164,4 +169,69 @@ test('applyAnswer와 applyGrant는 카운터 리셋, decisions 추가, round와 
   assert.equal(loop.round, 8);
   assert.deepEqual(loop.lastOutput, plan());
   assert.equal(loop.decisions.length, 3);
+});
+
+test('개발과 wiki 작업 메시지는 항목 수와 문서 action 수를 담는다', async () => {
+  const wiki: WikiAuthorOutput = {
+    status: 'DONE', blocker: null, responses: [], docs: [
+      { path: 'index.md', action: 'created', reason: '생성' },
+      { path: 'log.md', action: 'updated', reason: '갱신' },
+    ],
+  };
+  for (const [output, expected] of [
+    [dev(), '대상 1개 완료 보고'], [wiki, '문서 2개(created 1, updated 1)'],
+  ] as const) {
+    const events: Omit<RunEvent, 'at'>[] = [];
+    await runReviewLoop(loopState(), limits, {
+      author: async () => ok(output), gates: async () => [], review: async () => ok(review()),
+      emit: async event => { events.push(event); },
+    });
+    assert.equal(events[0].message, expected);
+  }
+});
+test('게이트는 문제 첫 줄과 GATE id, 검수는 summary와 지적 id를 기록한다', async () => {
+  const loop = loopState();
+  const events: Omit<RunEvent, 'at'>[] = [];
+  await runReviewLoop(loop, limits, {
+    author: async () => ok(plan()),
+    gates: async () => loop.round === 1 ? [
+      { ...finding('GATE-ITEMS'), problem: '항목 누락\n두 번째 줄' },
+      { ...finding('GATE-TESTS'), problem: '테스트 실패\r\n로그' },
+    ] : [],
+    review: async () => ok({ ...review(loop.round === 2 ? [finding(), finding('R-002')] : []),
+      summary: '계약이 비어 있다.\n검증 필요' }),
+    emit: async event => { events.push(event); },
+  });
+  assert.equal(events.find(e => e.type === 'gate')!.message,
+    'GATE-ITEMS: 항목 누락; GATE-TESTS: 테스트 실패');
+  assert.deepEqual(events.filter(e => e.type === 'review').map(e => e.message), [
+    '계약이 비어 있다. 검증 필요 (R-001, R-002)', '계약이 비어 있다. 검증 필요',
+  ]);
+});
+for (const length of [200, 201]) {
+  test(`판정 메시지는 줄바꿈을 공백으로 바꾸고 ${length}자에서 길이를 제한한다`, async () => {
+    const events: Omit<RunEvent, 'at'>[] = [];
+    const summary = '첫\r\n줄\n' + '가'.repeat(length - 4);
+    await runReviewLoop(loopState(), { sameIssueLimit: 1, maxReviewRounds: 1 }, {
+      author: async () => ok({ ...plan(), summary }),
+      gates: async () => [{ ...finding('GATE-REQ'), problem: '나'.repeat(length) }],
+      review: async () => { assert.fail('게이트 반려 시 검수 없음'); },
+      emit: async event => { events.push(event); },
+    });
+    assert.equal(events[0].message, length === 200 ? '첫 줄 ' + '가'.repeat(196)
+      : '첫 줄 ' + '가'.repeat(195) + '…');
+    for (const event of events) {
+      assert.ok(event.message.length <= 200);
+      assert.ok(!/[\r\n]/.test(event.message));
+    }
+  });
+}
+test('긴 검수 메시지도 200자 이하로 기록한다', async () => {
+  const events: Omit<RunEvent, 'at'>[] = [];
+  await runReviewLoop(loopState(), limits, {
+    author: async () => ok(plan()), gates: async () => [],
+    review: async () => ok({ ...review(), summary: '가'.repeat(201) }),
+    emit: async event => { events.push(event); },
+  });
+  assert.equal(events.at(-1)!.message, '가'.repeat(199) + '…');
 });

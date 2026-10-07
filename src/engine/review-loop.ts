@@ -1,5 +1,16 @@
-import type { Blocker, Issue, LoopState, Pending, ReviewOutput, RunEvent } from '../types.ts';
+import type { Issue, LoopState, Pending, ReviewOutput, RunEvent } from '../types.ts';
 import type { InvokeOutcome } from './invoke.ts';
+import { eventMessage } from './event-message.ts';
+
+type AuthorOutput = NonNullable<LoopState['lastOutput']>;
+function authorMessage(output: AuthorOutput): string {
+  if (output.status === 'BLOCKED') return `${output.blocker!.kind}: ${output.blocker!.detail}`;
+  if ('summary' in output) return output.summary;
+  if ('items' in output) return `대상 ${output.items.length}개 완료 보고`;
+  const created = output.docs.filter(doc => doc.action === 'created').length;
+  const updated = output.docs.filter(doc => doc.action === 'updated').length;
+  return `문서 ${output.docs.length}개(created ${created}, updated ${updated})`;
+}
 
 export type LoopPending = Omit<Pending, 'id' | 'createdAt' | 'lane' | 'stage'>;
 export type LoopHooks<A> = {
@@ -16,11 +27,13 @@ export function pending(
 ): LoopPending {
   return { kind, exitCode, summary, detail, resetAt };
 }
-export async function runReviewLoop<A extends { status: string; blocker: Blocker | null }>(
+export async function runReviewLoop<A extends AuthorOutput>(
   loop: LoopState, limits: { sameIssueLimit: number; maxReviewRounds: number }, hooks: LoopHooks<A>,
 ): Promise<LoopResult<A>> {
   async function emit(type: 'author' | 'gate' | 'review' | 'pause', verdict: string, message: string) {
-    await hooks.emit({ type, verdict, message, round: loop.round, lane: null, stage: null, role: null });
+    await hooks.emit({
+      type, verdict, message: eventMessage(message), round: loop.round, lane: null, stage: null, role: null,
+    });
   }
   async function pause(value: LoopPending): Promise<LoopResult<A>> {
     await emit('pause', value.kind, value.summary);
@@ -34,7 +47,8 @@ export async function runReviewLoop<A extends { status: string; blocker: Blocker
   while (true) {
     loop.round += 1;
     const author = await hooks.author(loop);
-    await emit('author', author.kind === 'ok' ? author.output.status : author.kind, '작업 호출을 완료했습니다.');
+    await emit('author', author.kind === 'ok' ? author.output.status : author.kind,
+      author.kind === 'ok' ? authorMessage(author.output) : author.detail);
     if (author.kind !== 'ok') return pause(callFailure(author));
     const output = author.output;
     if (output.status === 'BLOCKED') {
@@ -45,10 +59,15 @@ export async function runReviewLoop<A extends { status: string; blocker: Blocker
     let issues = await hooks.gates(output, loop);
     const gateRejected = issues.length > 0;
     await emit('gate', gateRejected ? 'REJECTED' : 'PASSED',
-      gateRejected ? '기계 게이트가 작업을 반려했습니다.' : '기계 게이트를 통과했습니다.');
+      gateRejected ? issues.map(issue => `${issue.id}: ${issue.problem.split(/\r\n|[\r\n]/)[0]}`).join('; ')
+        : '통과');
     if (!gateRejected) {
       const review = await hooks.review(output, loop);
-      await emit('review', review.kind === 'ok' ? review.output.verdict : review.kind, '검수 호출을 완료했습니다.');
+      const message = review.kind === 'ok'
+        ? review.output.summary + (review.output.verdict !== 'APPROVED' && review.output.issues.length
+          ? ` (${review.output.issues.map(issue => issue.id).join(', ')})` : '')
+        : review.detail;
+      await emit('review', review.kind === 'ok' ? review.output.verdict : review.kind, message);
       if (review.kind !== 'ok') return pause(callFailure(review));
       if (review.output.verdict === 'BLOCKED') {
         return pause(pending('reviewer_blocked', 20, '검수자가 판정할 수 없습니다.', review.output.blocker!.detail));

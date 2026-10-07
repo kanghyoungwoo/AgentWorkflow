@@ -1,3 +1,4 @@
+import { run, resume } from './commands/run.ts';
 import { doctor } from './commands/doctor.ts';
 import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
@@ -213,6 +214,8 @@ export function parseCommandLine(argv: string[]): ParseResult {
   }
 }
 const handlers: Partial<Record<CommandLine['command'], (command: CommandLine) => Promise<ExitCode>>> = {
+  run: command => run(command as Extract<CommandLine, { command: 'run' }>),
+  resume: command => resume(command as Extract<CommandLine, { command: 'resume' }>),
   doctor: command => doctor(command as Extract<CommandLine, { command: 'doctor' }>),
 };
 export async function main(argv: string[]): Promise<ExitCode> {

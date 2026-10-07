@@ -1,0 +1,30 @@
+{
+  "testCommand": "npm test",
+  "app": {
+    "startCommand": "node server.mjs --port {port}",
+    "readyUrl": "http://127.0.0.1:{port}/"
+  },
+  "roles": {
+    "planningAuthor": {
+      "client": "claude"
+    },
+    "planningReviewer": {
+      "client": "claude"
+    },
+    "devAuthor": {
+      "client": "claude"
+    },
+    "devReviewer": {
+      "client": "claude"
+    },
+    "qa": {
+      "client": "claude"
+    },
+    "wikiAuthor": {
+      "client": "claude"
+    },
+    "wikiReviewer": {
+      "client": "claude"
+    }
+  }
+}
